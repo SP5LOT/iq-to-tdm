@@ -1,0 +1,18 @@
+{
+    "annotations": [
+    ],
+    "captures": [
+        {
+            "core:datetime": "2026-02-21T15:19:16.687Z",
+            "core:frequency": 2260790300,
+            "core:sample_start": 0
+        }
+    ],
+    "global": {
+        "core:datatype": "cf32_le",
+        "core:hw": "OsmoSDR: 'device=\\'HackRF One\\',driver=hackrf,part_id=a000cb3c00414765,serial=0000000000000000081c69dc309e8c1b,soapy=1,version=local-608c8c35'",
+        "core:recorder": "Gqrx 2.17.3",
+        "core:sample_rate": 125000,
+        "core:version": "1.0.0"
+    }
+}

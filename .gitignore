@@ -1,0 +1,38 @@
+# IQ data files — too large for git
+*.sigmf-data
+*.raw
+*.bin
+*.iq
+*.cf32
+*.ci16
+
+# Large generated TDM output (root directory only)
+/kplo_20260221.tdm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Backups
+*.bak*
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/
+
+# Workflow/debug scripts
+camras_workflow.py
+correlate.py
+find.py
