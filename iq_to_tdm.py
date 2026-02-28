@@ -88,7 +88,7 @@ def read_sigmf_meta(meta_path):
     }
 
 
-def load_iq(data_path, datatype, max_samples=None):
+def load_iq(data_path, datatype, max_samples=None, skip_samples=None):
     """
     Ładuje plik IQ i zwraca tablicę complex64.
     Dla plików >2 GB używa np.memmap zamiast np.fromfile,
@@ -109,16 +109,20 @@ def load_iq(data_path, datatype, max_samples=None):
     elem_dtype = raw_map[dt]
     elem_size  = np.dtype(elem_dtype).itemsize
     n_elems    = file_size // elem_size
+    skip_elems = (skip_samples * 2) if skip_samples else 0
     if max_samples:
-        n_elems = min(n_elems, max_samples * 2)
+        n_elems = min(n_elems - skip_elems, max_samples * 2)
+    else:
+        n_elems = n_elems - skip_elems
 
     LARGE_FILE_BYTES = 2 * 1024 ** 3  # 2 GB
     if file_size > LARGE_FILE_BYTES:
-        raw = np.memmap(str(data_path), dtype=elem_dtype, mode='r', shape=(n_elems,))
+        raw = np.memmap(str(data_path), dtype=elem_dtype, mode='r',
+                        offset=skip_elems * np.dtype(elem_dtype).itemsize,
+                        shape=(n_elems,))
     else:
         raw = np.fromfile(str(data_path), dtype=elem_dtype)
-        if max_samples:
-            raw = raw[: max_samples * 2]
+        raw = raw[skip_elems : skip_elems + n_elems]
 
     if dt.startswith("cf32"):
         # memmap view nie wymaga .copy() – process_iq czyta blokami
@@ -856,6 +860,8 @@ def build_parser():
                    ))
     p.add_argument("--max-samples",  type=int,  default=None,
                    help="Max probek do zaladowania (do testow na duzych plikach)")
+    p.add_argument("--skip-samples", type=int,  default=None,
+                   help="Pomij pierwszych N probek (do testowania srodka pliku)")
     p.add_argument("--output",  "-o", default=None, help="Plik wyjsciowy TDM")
     p.add_argument("--participant-1", type=str, default=None,
                    help="Spacecraft name for PARTICIPANT_1 (default: ORION)")
@@ -900,7 +906,7 @@ def main():
         if info["start_time"]:
             print(f"  Start     : {info['start_time'].isoformat()}")
         print(f"\nLaduje IQ z: {data_path}")
-        iq = load_iq(data_path, info["datatype"], args.max_samples)
+        iq = load_iq(data_path, info["datatype"], args.max_samples, args.skip_samples)
     else:
         data_path = inp
         fn_info   = parse_gqrx_filename(inp.name)
@@ -913,12 +919,14 @@ def main():
                   f"rate={info.get('sample_rate',0)/1e6:.3f} Msps  "
                   f"start={info.get('start_time','?')}")
         print(f"\nLaduje IQ z: {data_path}")
-        iq = load_iq(data_path, info["datatype"], args.max_samples)
+        iq = load_iq(data_path, info["datatype"], args.max_samples, args.skip_samples)
 
     # ── Override z CLI ─────────────────────────────────────────────────────
     if args.freq:  info["center_freq"] = args.freq
     if args.rate:  info["sample_rate"] = args.rate
     if args.start: info["start_time"]  = _parse_dt(args.start)
+    if args.skip_samples and info.get("start_time") and info.get("sample_rate"):
+        info["start_time"] += timedelta(seconds=args.skip_samples / info["sample_rate"])
 
     missing = [k for k in ("center_freq","sample_rate","start_time") if not info.get(k)]
     if missing:
