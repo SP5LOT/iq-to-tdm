@@ -674,6 +674,43 @@ def process_iq(
                 if adapted:
                     print(f"  [adaptive] probe acceptance after adaptation: "
                           f"{n_ok_probe}/{probe_n} ({accept_rate*100:.0f}%)")
+
+                    # If still no signal even at max welch-sub, the recording
+                    # may have started before the spacecraft appeared. Scan
+                    # forward through the file to find the onset block.
+                    if accept_rate == 0.0:
+                        print(f"  [adaptive] no signal in probe window -- "
+                              f"scanning file for signal onset...")
+                        scan_step = max(probe_n, max(1, n_blocks // 30))
+                        found_at = None
+                        for scan_i in range(probe_n, n_blocks, scan_step):
+                            blk = iq[scan_i * spb : (scan_i + 1) * spb]
+                            if len(blk) < spb:
+                                break
+                            try:
+                                _, snr_scan = estimate_carrier(
+                                    blk, sample_rate, center_freq,
+                                    fft_size=eff_fft, n_sub=n_welch_sub,
+                                    search_bw=search_bw, carrier_hint=carrier_hint,
+                                    hint_bw=hint_bw, excl_sidebands=excl_sidebands,
+                                    oqpsk=oqpsk,
+                                )
+                                if snr_scan >= min_snr_db:
+                                    found_at = scan_i
+                                    break
+                            except Exception:
+                                pass
+                        if found_at is not None:
+                            onset_sec = found_at * integration_sec
+                            onset_t = start_time + timedelta(seconds=onset_sec)
+                            print(f"  [adaptive] signal found at block {found_at+1}/{n_blocks} "
+                                  f"(~{onset_sec/60:.1f} min into recording, "
+                                  f"~{onset_t.strftime('%H:%M:%S')} UTC)")
+                            print(f"  Blocks before onset will be stored as 0 Hz.")
+                        else:
+                            print(f"  [adaptive] no signal found anywhere in recording.")
+                            print(f"  Check antenna pointing, center frequency, or IQ file.")
+
                     print(f"  Continuing from block {i+2}/{n_blocks} "
                           f"with welch-sub={n_welch_sub}...\n")
 
