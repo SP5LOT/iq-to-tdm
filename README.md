@@ -82,6 +82,12 @@ Output: **`examples/kplo_20260221.tdm`** — 6851 measurements, 1-second integra
 SNR 7–12 dB throughout the visible pass. The result is fully reproducible:
 re-running the converter on the same file produces bit-identical output.
 
+![KPLO/Danuri Doppler profile](examples/kplo_doppler.png)
+
+*Left: full 1h54min pass (6851 measurements) — classic satellite Doppler arc.
+Right: active tracking window (4385 measurements, 15:47–17:05 UTC) — smooth
++34210 → +28123 Hz drift as KPLO moved across the sky.*
+
 ---
 
 ## Repository Contents — `examples/`
