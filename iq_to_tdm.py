@@ -900,7 +900,7 @@ def main():
 
     print(f"\nNazwa wg konwencji NASA:")
     print(f"  {args.station}_Antenna1_{t0.strftime('%Y%m%d%H%M%S')}.tdm")
-    print(f"\nKontakt NASA: marta.b.shelton@nasa.gov")
+    print(f"\nAby przeslac plik do NASA, skontaktuj sie z programem Artemis Amateur Tracking.")
 
 
 if __name__ == "__main__":
