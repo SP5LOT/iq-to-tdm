@@ -1,39 +1,35 @@
 #!/usr/bin/env python3
 """
-IQ → NASA CCSDS TDM Converter  (wersja z Welch averaging dla słabych sygnałów)
-================================================================================
-Konwertuje nagrania IQ (SigMF lub GQRX) na plik TDM dla NASA Artemis II.
+IQ -> NASA CCSDS TDM Converter  (Welch averaging for weak signals)
+==================================================================
+Converts SDR IQ recordings (SigMF or GQRX) to a NASA CCSDS TDM v2.0 file
+for Artemis II / lunar mission one-way Doppler tracking.
 
-KLUCZOWA RÓŻNICA OD PROSTEJ WERSJI:
-  - Używa metody Welcha (uśrednianie wielu FFT) dla niskiego SNR
-  - Wyszukuje WĄSKĄ nośną (residual carrier PCM/PM/NRZ), nie sidebands
-  - Działa z małymi antenami (9–20 m apertura)
+Key features:
+  - Welch averaged periodogram for low-SNR carrier detection (+13 dB with default 20 sub-blocks)
+  - Searches for the narrow residual carrier (PCM/PM/NRZ), not sidebands
+  - --oqpsk mode: IQ^4 suppressed-carrier recovery for OQPSK signals (Artemis II)
+  - --auto mode: per-block automatic selection between CW and OQPSK
+  - Works with small antennas (120 cm dish and up)
 
-SYGNAŁ ORIONA (Artemis II):
-  - Modulacja: PCM/PM/NRZ (Phase Modulation + Non-Return-to-Zero)
-  - Nośna: 2216.5 MHz (residual carrier – NIE jest w pełni stłumiona)
-  - Data rate: 72 ksps (contingency) lub 2 Msps (nominal) lub 4/6 Msps (SQPSK)
-  - Na widmie widzisz: wąska linia nośnej + sinc-shaped sidebands po bokach
-  - MY MIERZYMY TYLKO NOŚNĄ – sidebands nas nie interesują
+Usage:
+  # SigMF (recommended):
+  python iq_to_tdm.py --input recording.sigmf-meta --station MY_CALL --auto
 
-Użycie:
-  # SigMF:
-  python iq_to_tdm.py --input nagranie.sigmf-meta --station MY_CALL
-
-  # GQRX raw (freq i rate z nazwy pliku):
+  # GQRX raw (freq and rate from filename):
   python iq_to_tdm.py --input gqrx_20260210_120000_2216500000_2000000_fc.raw --station MY_CALL
 
-  # GQRX raw (ręczne parametry):
-  python iq_to_tdm.py --input nagranie.raw \\
+  # GQRX raw (manual parameters):
+  python iq_to_tdm.py --input recording.raw \\
       --freq 2216500000 --rate 2000000 --start "2026-02-10T12:00:00Z" \\
       --station MY_CALL
 
-  # Słaby sygnał – więcej uśredniania:
-  python iq_to_tdm.py --input nagranie.sigmf-meta --station MY_CALL \\
+  # Weak signal -- more averaging:
+  python iq_to_tdm.py --input recording.sigmf-meta --station MY_CALL \\
       --integration 10 --welch-sub 50 --min-snr 2.0
 
-  # Znana pozycja nośnej na wodospadzie (np. 15 kHz poniżej center):
-  python iq_to_tdm.py --input nagranie.sigmf-meta --station MY_CALL \\
+  # Known carrier position (e.g. 15 kHz below center):
+  python iq_to_tdm.py --input recording.sigmf-meta --station MY_CALL \\
       --carrier-hint -15000
 """
 
@@ -49,22 +45,22 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Stałe NASA / S-band
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# NASA / S-band constants
+# ---------------------------------------------------------------------------
 
-TURNAROUND_NUMERATOR   = 240   # S-band
+TURNAROUND_NUMERATOR   = 240   # S-band coherent turnaround ratio
 TURNAROUND_DENOMINATOR = 221
 
-# Typowe data rates Oriona → sidebands w tych odległościach od nośnej
+# Orion data rates -> sideband positions relative to carrier
 ORION_DATA_RATES_HZ = [72_000, 2_000_000, 4_000_000, 6_000_000]
-# Szerokość ochronna wokół sideband (Hz) – obszar wyłączony z wyszukiwania nośnej
+# Guard band around each sideband (Hz) -- excluded from carrier search
 SIDEBAND_GUARD_HZ = 5_000
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Parsowanie SigMF
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# SigMF parsing
+# ---------------------------------------------------------------------------
 
 def read_sigmf_meta(meta_path):
     with open(meta_path) as f:
@@ -90,9 +86,8 @@ def read_sigmf_meta(meta_path):
 
 def load_iq(data_path, datatype, max_samples=None, skip_samples=None):
     """
-    Ładuje plik IQ i zwraca tablicę complex64.
-    Dla plików >2 GB używa np.memmap zamiast np.fromfile,
-    żeby nie wczytywać całości do RAM naraz.
+    Load IQ file and return complex64 array.
+    Uses np.memmap for files larger than 2 GB to avoid loading everything into RAM.
     """
     raw_map = {
         "cf32_le": np.float32, "cf32_be": np.float32,
@@ -103,7 +98,7 @@ def load_iq(data_path, datatype, max_samples=None, skip_samples=None):
     }
     dt = datatype.lower()
     if dt not in raw_map:
-        raise ValueError(f"Nieobslugiwany datatype: {dt}")
+        raise ValueError(f"Unsupported datatype: {dt}")
 
     file_size = os.path.getsize(str(data_path))
     elem_dtype = raw_map[dt]
@@ -125,7 +120,6 @@ def load_iq(data_path, datatype, max_samples=None, skip_samples=None):
         raw = raw[skip_elems : skip_elems + n_elems]
 
     if dt.startswith("cf32"):
-        # memmap view nie wymaga .copy() – process_iq czyta blokami
         iq = raw.view(np.complex64)
         if "be" in dt:
             iq = iq.byteswap().newbyteorder()
@@ -141,14 +135,14 @@ def load_iq(data_path, datatype, max_samples=None, skip_samples=None):
         f  = raw.astype(np.float32) - 127.5
         iq = (f[0::2] + 1j * f[1::2]).astype(np.complex64)
     else:
-        raise ValueError(f"Nie wiem jak zaladowac: {dt}")
+        raise ValueError(f"Cannot load datatype: {dt}")
 
     return iq
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Parsowanie GQRX z nazwy pliku
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# GQRX filename parsing
+# ---------------------------------------------------------------------------
 
 def parse_gqrx_filename(name):
     """gqrx_YYYYMMDD_HHMMSS_FREQ_RATE_fc.raw"""
@@ -169,9 +163,9 @@ def parse_gqrx_filename(name):
     return info
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Czas
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Time helpers
+# ---------------------------------------------------------------------------
 
 def _parse_dt(s):
     s = s.strip().rstrip("Z")
@@ -181,40 +175,40 @@ def _parse_dt(s):
             return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             pass
-    raise ValueError(f"Nie moge sparsowac daty: '{s}'")
+    raise ValueError(f"Cannot parse datetime: '{s}'")
 
 
 def _dt_to_tdm(dt):
-    """YYYY-DOYThh:mm:ss.mmm  (format CCSDS TDM day-of-year)"""
+    """YYYY-DOYThh:mm:ss.mmm  (CCSDS TDM day-of-year format)"""
     doy = dt.timetuple().tm_yday
     return (f"{dt.year}-{doy:03d}T"
             f"{dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}."
             f"{dt.microsecond // 1000:03d}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# DSP CORE: Welch periodogram
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# DSP core: Welch periodogram
+# ---------------------------------------------------------------------------
 
 def welch_psd(iq_block, fft_size, n_sub):
     """
-    Uśredniony periodogram metodą Welcha z 50% overlap.
+    Averaged periodogram using Welch method with 50% overlap.
 
-    Dlaczego to działa przy słabym sygnale:
-      Szum jest losowy  → uśrednianie N widm redukuje go o sqrt(N)
-      Nośna CW jest deterministyczna → jej moc NIE maleje przy uśrednianiu
-      Zysk SNR = 10*log10(n_sub) dB
-        n_sub=20  → +13 dB
-        n_sub=100 → +20 dB
-        n_sub=500 → +27 dB
+    Why this works for weak signals:
+      Noise is random  -> averaging N spectra reduces it by sqrt(N)
+      CW carrier is deterministic -> its power does NOT decrease with averaging
+      SNR gain = 10*log10(n_sub) dB
+        n_sub=20  -> +13 dB
+        n_sub=100 -> +20 dB
+        n_sub=500 -> +27 dB
 
     Args:
-        iq_block : tablica complex64
-        fft_size : rozmiar jednego FFT (powinien być potęgą 2)
-        n_sub    : max liczba sub-bloków do uśrednienia
+        iq_block : complex64 array
+        fft_size : single FFT size (should be power of 2)
+        n_sub    : max number of sub-blocks to average
 
     Returns:
-        Uśrednione widmo mocy (float64), długość fft_size
+        Averaged power spectrum (float64), length fft_size
     """
     hop    = fft_size // 2   # 50% overlap
     window = np.hanning(fft_size).astype(np.float32)
@@ -232,13 +226,13 @@ def welch_psd(iq_block, fft_size, n_sub):
         count += 1
 
     if count == 0:
-        raise ValueError("Za malo probek dla Welch PSD – zwieksz integration lub zmniejsz fft_size")
+        raise ValueError("Too few samples for Welch PSD -- increase integration or reduce fft_size")
 
     return psd / count
 
 
 def _parabolic(psd, k, fft_size, sr):
-    """Interpolacja paraboliczna binu FFT → dokładniejszy offset [Hz]."""
+    """Parabolic interpolation of FFT bin -> more accurate offset [Hz]."""
     if 0 < k < fft_size - 1:
         y1, y2, y3 = psd[k-1], psd[k], psd[k+1]
         denom = 2*y2 - y1 - y3
@@ -261,44 +255,44 @@ def estimate_carrier(
     oqpsk       = False,
 ):
     """
-    Znajdź residual carrier PCM/PM/NRZ metodą Welcha.
+    Find residual PCM/PM/NRZ carrier using Welch method.
 
-    Tryb --oqpsk (M-th power carrier recovery):
-      Dla OQPSK (suppressowana nośna) podnosimy IQ do 4. potęgi.
-      Modulacja QPSK znika (fazy 0/90/180/270° → wszystkie ×4 = 0°),
-      pozostaje czysta linia CW na 4×Δf. Wynik dzielimy przez 4.
+    --oqpsk mode (M-th power carrier recovery):
+      For OQPSK (suppressed carrier) raise IQ to 4th power.
+      QPSK modulation cancels (phases 0/90/180/270 deg * 4 = 0 deg),
+      leaving a pure CW line at 4*delta_f. Result divided by 4.
 
-    Logika maski wyszukiwania:
-      1. search_bw  → ogranicz do środkowego search_bw Hz
-      2. carrier_hint → szukaj tylko ±hint_bw Hz wokół podpowiedzi (domyślnie ±50 kHz)
-      3. excl_sidebands → wyklucz obszary przy ±dr od center (sidebands)
+    Search mask logic:
+      1. search_bw  -> restrict to central search_bw Hz
+      2. carrier_hint -> search only within +/-hint_bw Hz of hint (default +/-50 kHz)
+      3. excl_sidebands -> exclude regions near +/-data_rate from center
 
     Returns:
         (freq_abs_hz, snr_db)
     """
     if oqpsk:
-        # Podnieś do 4. potęgi — usuwa modulację OQPSK, zostaje CW na 4×Δf
+        # Raise to 4th power -- removes OQPSK modulation, leaves CW at 4*delta_f
         iq_proc = (iq_block.astype(np.complex128) ** 4).astype(np.complex64)
     else:
         iq_proc = iq_block
 
     psd   = welch_psd(iq_proc, fft_size, n_sub)
-    freqs = np.fft.fftfreq(fft_size, d=1.0/sample_rate)   # offset [Hz] od center
+    freqs = np.fft.fftfreq(fft_size, d=1.0/sample_rate)   # offset [Hz] from center
     bin_hz = sample_rate / fft_size
 
-    # ── Maska wyszukiwania ──────────────────────────────────────────────────
+    # -- Search mask --------------------------------------------------------
     if carrier_hint is not None:
-        # Znamy mniej więcej gdzie jest sygnał na wodospadzie
+        # Approximate carrier position known from waterfall
         mask = np.abs(freqs - carrier_hint) <= hint_bw
     elif search_bw is not None:
         mask = np.abs(freqs) <= search_bw / 2
     else:
-        # Szukaj w środkowych 80% pasma (unikamy artefaktów krawędzi filtra)
+        # Search inner 80% of band (avoid filter edge artifacts)
         mask = np.abs(freqs) <= sample_rate * 0.40
 
-    # ── Wyklucz obszary sideband ────────────────────────────────────────────
-    # PCM/PM/NRZ: sidebands przy ±dr, ±3dr, ±5dr od nośnej
-    # Dla bezpieczeństwa wykluczamy tylko ±dr (pierwsze, najsilniejsze)
+    # -- Exclude sideband regions -------------------------------------------
+    # PCM/PM/NRZ: sidebands at +/-dr, +/-3dr, +/-5dr from carrier
+    # Only exclude +/-dr (first, strongest)
     if excl_sidebands:
         for dr in ORION_DATA_RATES_HZ:
             guard = SIDEBAND_GUARD_HZ + dr * 0.05
@@ -306,30 +300,30 @@ def estimate_carrier(
                 mask[np.abs(freqs - sign * dr) < guard] = False
 
     if not np.any(mask):
-        # Fallback: zniesienie maski sideband (może nie być danych w tym pasmie)
+        # Fallback: drop sideband mask (may not apply to this band)
         mask = np.abs(freqs) <= sample_rate * 0.40
 
     psd_m = np.where(mask, psd, 0.0)
     peak  = int(np.argmax(psd_m))
 
-    # Subbin accuracy przez interpolację paraboliczną
+    # Sub-bin accuracy via parabolic interpolation
     raw_offset = _parabolic(psd, peak, fft_size, sample_rate)
-    # fftfreq convention: bin > N/2 → ujemne częstotliwości
+    # fftfreq convention: bin > N/2 -> negative frequencies
     if peak > fft_size // 2:
         raw_offset -= sample_rate
 
-    # OQPSK: sygnał był na 4×Δf → podziel przez 4
+    # OQPSK: signal was at 4*delta_f -> divide by 4
     if oqpsk:
         raw_offset /= 4.0
 
     freq_abs = center_freq + raw_offset
 
-    # ── SNR ─────────────────────────────────────────────────────────────────
-    # Sygnał: kilka binów wokół szczytu (≈ szerokość nośnej CW)
+    # -- SNR ----------------------------------------------------------------
+    # Signal: a few bins around peak (approx CW carrier width)
     sig_w = max(3, int(200.0 / bin_hz))
     sig_p = float(np.mean(psd[max(0,peak-sig_w) : peak+sig_w+1]))
 
-    # Szum: mediana dalszych binów (odporność na inne sygnały)
+    # Noise: median of distant bins (robust against other signals)
     noise_mask = mask.copy()
     excl_w = max(sig_w * 8, int(2000.0 / bin_hz))
     noise_mask[max(0,peak-excl_w) : peak+excl_w+1] = False
@@ -345,41 +339,41 @@ def estimate_carrier(
     return freq_abs, snr_db
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Interaktywna diagnostyka fazy próbkowania
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Interactive probe-phase diagnostics
+# ---------------------------------------------------------------------------
 
 def _interactive_probe(probe_raw, rejected_snrs, probe_n,
                        min_snr_db, carrier_hint, n_welch_sub, center_freq):
     """
-    Analizuje wyniki pierwszych probe_n bloków i pyta użytkownika o korektę.
+    Analyse results of the first probe_n blocks and offer parameter adjustments.
 
     Args:
-        probe_raw     : lista (t, freq_abs, snr) – WSZYSTKIE bloki próbki
-        rejected_snrs : lista snr bloków poniżej progu
-        probe_n       : liczba bloków próbki
-        min_snr_db    : bieżący próg SNR
-        carrier_hint  : bieżący carrier hint (lub None)
-        n_welch_sub   : bieżąca liczba sub-bloków Welcha
-        center_freq   : częstotliwość centralna [Hz]
+        probe_raw     : list of (t, freq_abs, snr) -- ALL probe blocks
+        rejected_snrs : list of SNR values for rejected blocks
+        probe_n       : number of probe blocks
+        min_snr_db    : current SNR threshold
+        carrier_hint  : current carrier hint (or None)
+        n_welch_sub   : current number of Welch sub-blocks
+        center_freq   : center frequency [Hz]
 
     Returns:
-        dict z nowymi parametrami, np. {'min_snr_db': 1.5} lub {}
+        dict with updated parameters, e.g. {'min_snr_db': 1.5} or {}
     """
     n_ok = len([r for r in probe_raw if r[2] >= min_snr_db])
     accept_rate = n_ok / max(probe_n, 1)
 
-    SEP = "─" * 54
+    SEP = "-" * 54
     print(f"\n  {SEP}")
-    print(f"  Diagnostyka po {probe_n} blokach próbkowania:")
-    print(f"  Akceptacja : {n_ok}/{probe_n} ({accept_rate*100:.0f}%)", end="")
+    print(f"  Diagnostics after {probe_n} probe blocks:")
+    print(f"  Acceptance : {n_ok}/{probe_n} ({accept_rate*100:.0f}%)", end="")
 
     if accept_rate >= 0.70:
-        print("  ✓ OK")
+        print("  OK")
         print(f"  {SEP}\n")
         return {}
 
-    print("  ← niska!")
+    print("  <- low!")
 
     ok_snrs = [r[2] for r in probe_raw if r[2] >= min_snr_db]
     if ok_snrs:
@@ -390,48 +384,48 @@ def _interactive_probe(probe_raw, rejected_snrs, probe_n,
               f"drift={max(ok_offsets)-min(ok_offsets):.1f} Hz")
     if rejected_snrs:
         avg_rej = sum(rejected_snrs) / len(rejected_snrs)
-        print(f"  SNR odrzuc.: avg={avg_rej:.1f} dB  (próg={min_snr_db:.1f} dB)")
+        print(f"  SNR reject : avg={avg_rej:.1f} dB  (threshold={min_snr_db:.1f} dB)")
 
     suggestions = []
 
-    # Sugestia 1: obniż próg SNR
+    # Suggestion 1: lower SNR threshold
     if rejected_snrs:
         avg_rej = sum(rejected_snrs) / len(rejected_snrs)
         if avg_rej > min_snr_db * 0.4 and min_snr_db > 1.5:
             new_snr = max(1.0, round(avg_rej * 0.85, 1))
             suggestions.append({
-                'desc': f"Obniż próg SNR: {min_snr_db:.1f} → {new_snr:.1f} dB",
+                'desc': f"Lower SNR threshold: {min_snr_db:.1f} -> {new_snr:.1f} dB",
                 'param': 'min_snr_db', 'new': new_snr,
             })
 
-    # Sugestia 2: zwiększ Welch sub-bloki
+    # Suggestion 2: increase Welch sub-blocks
     if n_welch_sub < 100 and accept_rate < 0.5:
         new_sub = min(200, n_welch_sub * 4)
         gain = 10 * math.log10(new_sub / n_welch_sub)
         suggestions.append({
-            'desc': f"Zwiększ Welch sub-bloki: {n_welch_sub} → {new_sub} (+{gain:.0f} dB SNR)",
+            'desc': f"Increase Welch sub-blocks: {n_welch_sub} -> {new_sub} (+{gain:.0f} dB SNR)",
             'param': 'n_welch_sub', 'new': new_sub,
         })
 
-    # Sugestia 3: podaj carrier-hint
+    # Suggestion 3: provide carrier hint
     if carrier_hint is None and accept_rate < 0.2:
         suggestions.append({
-            'desc': "Podaj przybliżony offset nośnej od center [Hz] jako carrier-hint",
-            'param': 'carrier_hint', 'new': None,  # wartość podana przez użytkownika
+            'desc': "Provide approximate carrier offset from center [Hz] as carrier-hint",
+            'param': 'carrier_hint', 'new': None,  # value provided by user
         })
 
     if not suggestions:
-        print(f"\n  Brak konkretnych sugestii – kontynuuję z obecnymi parametrami.")
+        print(f"\n  No specific suggestions -- continuing with current parameters.")
         print(f"  {SEP}\n")
         return {}
 
-    print(f"\n  Proponowane zmiany (wybierz numer lub Enter = bez zmian):")
+    print(f"\n  Suggested changes (enter number or Enter = no change):")
     for k, s in enumerate(suggestions, 1):
         print(f"  [{k}] {s['desc']}")
-    print(f"  [0] Kontynuuj bez zmian")
+    print(f"  [0] Continue without changes")
 
     try:
-        choice = input(f"\n  Twój wybór (0-{len(suggestions)}): ").strip()
+        choice = input(f"\n  Your choice (0-{len(suggestions)}): ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
         print(f"  {SEP}\n")
@@ -445,15 +439,15 @@ def _interactive_probe(probe_raw, rejected_snrs, probe_n,
         idx = int(choice) - 1
         if 0 <= idx < len(suggestions):
             s = suggestions[idx]
-            if s['new'] is None:  # carrier_hint – ask for value
+            if s['new'] is None:  # carrier_hint -- ask for value
                 try:
-                    val_str = input("  Podaj offset nośnej od center [Hz] (np. -15000): ").strip()
+                    val_str = input("  Enter carrier offset from center [Hz] (e.g. -15000): ").strip()
                     s['new'] = float(val_str)
                 except (ValueError, EOFError):
-                    print("  Niepoprawna wartość – bez zmian.")
+                    print("  Invalid value -- no change.")
                     print(f"  {SEP}\n")
                     return {}
-            print(f"  ✓ Zastosowano: {s['desc']}")
+            print(f"  Applied: {s['desc']}")
             print(f"  {SEP}\n")
             return {s['param']: s['new']}
     except ValueError:
@@ -463,9 +457,9 @@ def _interactive_probe(probe_raw, rejected_snrs, probe_n,
     return {}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Przetwarzanie blokowe
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Block processing
+# ---------------------------------------------------------------------------
 
 def process_iq(
     iq, sample_rate, center_freq, start_time,
@@ -482,14 +476,14 @@ def process_iq(
     auto            = False,
 ):
     """
-    Przesuwa okno integracji i zbiera pomiary częstotliwości nośnej.
+    Slide integration window and collect carrier frequency measurements.
 
-    Dla każdego bloku czasu:
-      - Welch PSD → SNR
-      - Filtr SNR
-      - Timestamp = KONIEC okna (INTEGRATION_REF = END, wymóg NASA)
+    For each time block:
+      - Welch PSD -> SNR
+      - SNR filter
+      - Timestamp = END of window (INTEGRATION_REF = END, required by NASA)
 
-    Returns: lista (datetime, freq_hz, snr_db)
+    Returns: list of (datetime, freq_hz, snr_db)
     """
     spb    = int(sample_rate * integration_sec)   # samples per block
     eff_fft = min(fft_size, spb // 2)
@@ -503,32 +497,32 @@ def process_iq(
     snr_gain = 10 * math.log10(max(1, n_welch_sub))
 
     print(f"\n{'='*64}")
-    print(f"  Probki IQ        : {len(iq):,}")
+    print(f"  IQ samples       : {len(iq):,}")
     print(f"  Sample rate      : {sample_rate/1e6:.3f} Msps")
     print(f"  Center freq      : {center_freq/1e6:.6f} MHz")
-    print(f"  Integracja       : {integration_sec:.1f} s ({spb:,} probek/blok)")
+    print(f"  Integration      : {integration_sec:.1f} s ({spb:,} samples/block)")
     print(f"  FFT size         : {eff_fft:,}  ({bin_hz:.2f} Hz/bin)")
-    print(f"  Welch sub-bloki  : {n_welch_sub}  (zysk SNR ~{snr_gain:.1f} dB)")
+    print(f"  Welch sub-blocks : {n_welch_sub}  (SNR gain ~{snr_gain:.1f} dB)")
     print(f"  Min SNR          : {min_snr_db:.1f} dB")
-    print(f"  Pasmo szukania   : +/-{search_bw/1e3:.0f} kHz")
+    print(f"  Search bandwidth : +/-{search_bw/1e3:.0f} kHz")
     if carrier_hint is not None:
-        print(f"  Carrier hint     : {carrier_hint:+.0f} Hz od center")
-    print(f"  Wyklucz sidebands: {'TAK' if excl_sidebands else 'NIE'}")
+        print(f"  Carrier hint     : {carrier_hint:+.0f} Hz from center")
+    print(f"  Excl. sidebands  : {'yes' if excl_sidebands else 'no'}")
     if auto:
-        print(f"  Tryb             : AUTO (nośna → OQPSK fallback)")
+        print(f"  Mode             : AUTO (carrier -> OQPSK fallback)")
     elif oqpsk:
-        print(f"  Tryb             : OQPSK (IQ^4, /4)")
+        print(f"  Mode             : OQPSK (IQ^4, /4)")
     else:
-        print(f"  Tryb             : carrier (Welch)")
-    print(f"  Bloków            : {n_blocks}")
+        print(f"  Mode             : carrier (Welch)")
+    print(f"  Blocks           : {n_blocks}")
     print(f"{'='*64}")
 
     measurements = []
     skipped = 0
-    rejected_snrs = []   # SNR odrzuconych bloków (poniżej progu)
-    probe_raw = []       # (t, freq_abs, snr) – wszystkie bloki fazy próbkowania
-    n_carrier_mode = 0   # bloki wykryte przez nośną (auto)
-    n_oqpsk_mode   = 0   # bloki wykryte przez OQPSK (auto)
+    rejected_snrs = []   # SNR of rejected blocks (below threshold)
+    probe_raw = []       # (t, freq_abs, snr) -- all blocks in probe phase
+    n_carrier_mode = 0   # blocks detected via direct carrier (auto mode)
+    n_oqpsk_mode   = 0   # blocks detected via OQPSK IQ^4 (auto mode)
 
     use_tty = interactive and sys.stdout.isatty() and sys.stdin.isatty()
     probe_n = min(20, max(10, n_blocks // 10))
@@ -538,12 +532,12 @@ def process_iq(
 
     for i in range(n_blocks):
         block = iq[i*spb : (i+1)*spb]
-        # Timestamp = koniec okna integracji
+        # Timestamp = end of integration window
         t = start_time + timedelta(seconds=(i + 1) * integration_sec)
 
         try:
             if auto:
-                # Próba 1: szukaj nośnej
+                # Attempt 1: direct carrier search
                 freq_abs, snr = estimate_carrier(
                     block, sample_rate, center_freq,
                     fft_size=eff_fft, n_sub=n_welch_sub,
@@ -553,7 +547,7 @@ def process_iq(
                 )
                 block_mode = 'C'
                 if snr < min_snr_db:
-                    # Próba 2: OQPSK (IQ^4) — wyższy próg SNR żeby uniknąć fałszywych detekcji
+                    # Attempt 2: OQPSK IQ^4 -- extra +2 dB margin to avoid false detections
                     freq_q, snr_q = estimate_carrier(
                         block, sample_rate, center_freq,
                         fft_size=eff_fft, n_sub=n_welch_sub,
@@ -561,7 +555,7 @@ def process_iq(
                         hint_bw=hint_bw, excl_sidebands=False,
                         oqpsk=True,
                     )
-                    if snr_q >= min_snr_db + 2.0:   # +2 dB margines dla OQPSK
+                    if snr_q >= min_snr_db + 2.0:   # +2 dB margin for OQPSK
                         freq_abs, snr, block_mode = freq_q, snr_q, 'Q'
             else:
                 freq_abs, snr = estimate_carrier(
@@ -574,9 +568,9 @@ def process_iq(
                 block_mode = 'Q' if oqpsk else 'C'
         except Exception as e:
             if use_tty:
-                print(f"\r  [ERR] blok {i+1:4d}: {e}     ")
+                print(f"\r  [ERR] block {i+1:4d}: {e}     ")
             else:
-                print(f"  [ERR] blok {i+1:4d}: {e}", file=sys.stderr)
+                print(f"  [ERR] block {i+1:4d}: {e}", file=sys.stderr)
             skipped += 1
             continue
 
@@ -593,11 +587,11 @@ def process_iq(
             skipped += 1
             rejected_snrs.append(snr)
 
-        # Zbierz dane fazy próbkowania (przed diagnozą)
+        # Collect probe phase data (before diagnostics)
         if not probe_done:
             probe_raw.append((t, freq_abs, snr))
 
-        # ── Pasek postępu (TTY) ───────────────────────────────────────────
+        # -- Progress bar (TTY) ---------------------------------------------
         if use_tty:
             elapsed = time.time() - t0_proc
             if i > 0 and elapsed > 0:
@@ -607,17 +601,17 @@ def process_iq(
                 eta_str = "ETA --:--"
             n_ok = len(measurements)
             accept_pct = n_ok / (i + 1) * 100
-            status = "✓" if accepted else "✗"
+            status = "v" if accepted else "x"
             mode_indicator = f"[{block_mode}] " if auto else ""
             bw = 28
             filled = int(bw * (i + 1) / n_blocks)
-            bar = '█' * filled + '░' * (bw - filled)
+            bar = '#' * filled + '.' * (bw - filled)
             print(f"\r  {status} {mode_indicator}[{bar}] {i+1}/{n_blocks} | "
                   f"ok:{n_ok}({accept_pct:.0f}%) | "
                   f"off:{offset:+.0f}Hz | SNR:{snr:.1f}dB | {eta_str}   ",
                   end='', flush=True)
         else:
-            # Nie-TTY: linie co jakiś czas (zachowane oryginalne zachowanie)
+            # Non-TTY: print lines periodically
             mode_tag = f'[{block_mode}]' if auto else '[OK]'
             if accepted:
                 if len(measurements) <= 5 or (i+1) % 30 == 0 or i == n_blocks-1:
@@ -626,13 +620,13 @@ def process_iq(
             else:
                 if len(rejected_snrs) <= 3 or (i+1) % 60 == 0:
                     print(f"  [--]  {i+1:4d}/{n_blocks}  "
-                          f"offset={offset:+10.2f} Hz  SNR={snr:5.1f} dB  <-- ponizej progu")
+                          f"offset={offset:+10.2f} Hz  SNR={snr:5.1f} dB  <-- below threshold")
 
-        # ── Diagnostyka po fazie próbkowania ──────────────────────────────
+        # -- Diagnostics after probe phase ----------------------------------
         if not probe_done and (i + 1) == probe_n:
             probe_done = True
             if use_tty:
-                print()  # newline po pasku postępu
+                print()  # newline after progress bar
             new_params = _interactive_probe(
                 probe_raw, rejected_snrs[:], probe_n,
                 min_snr_db, carrier_hint, n_welch_sub, center_freq,
@@ -640,52 +634,50 @@ def process_iq(
             if new_params:
                 if 'min_snr_db' in new_params:
                     min_snr_db = new_params['min_snr_db']
-                    # Przelicz bloki próbki z nowym progiem
+                    # Re-score probe blocks with new threshold
                     measurements = [(t2, f, s) for t2, f, s in probe_raw if s >= min_snr_db]
                     skipped = sum(1 for _, _, s in probe_raw if s < min_snr_db)
                     rejected_snrs = [s for _, _, s in probe_raw if s < min_snr_db]
-                    print(f"  Przeliczono {len(probe_raw)} bloków próbki → {len(measurements)} ok")
+                    print(f"  Re-scored {len(probe_raw)} probe blocks -> {len(measurements)} accepted")
                 if 'n_welch_sub' in new_params:
                     n_welch_sub = new_params['n_welch_sub']
                     snr_gain_new = 10 * math.log10(max(1, n_welch_sub))
-                    print(f"  Nowe Welch sub-bloki: {n_welch_sub} (zysk ~{snr_gain_new:.1f} dB)")
+                    print(f"  New Welch sub-blocks: {n_welch_sub} (gain ~{snr_gain_new:.1f} dB)")
                 if 'carrier_hint' in new_params:
                     carrier_hint = new_params['carrier_hint']
-                    print(f"  Nowy carrier hint: {carrier_hint:+.0f} Hz")
-                print(f"  Kontynuuję od bloku {i+2}/{n_blocks}...\n")
+                    print(f"  New carrier hint: {carrier_hint:+.0f} Hz")
+                print(f"  Continuing from block {i+2}/{n_blocks}...\n")
 
     if use_tty:
-        print()  # newline po ostatnim pasku postępu
+        print()  # newline after final progress bar
 
-    print(f"\n  Zaakceptowane: {len(measurements)}/{n_blocks}  (pominiete: {skipped})")
+    print(f"\n  Accepted: {len(measurements)}/{n_blocks}  (skipped: {skipped})")
 
     if measurements:
         offsets = [m[1]-center_freq for m in measurements]
         snrs    = [m[2] for m in measurements]
-        print(f"  Offset nośnej : min={min(offsets):+.1f}  max={max(offsets):+.1f}  "
+        print(f"  Carrier offset : min={min(offsets):+.1f}  max={max(offsets):+.1f}  "
               f"drift={max(offsets)-min(offsets):.1f} Hz")
-        print(f"  SNR           : min={min(snrs):.1f}  max={max(snrs):.1f}  "
-              f"sred={sum(snrs)/len(snrs):.1f} dB")
+        print(f"  SNR            : min={min(snrs):.1f}  max={max(snrs):.1f}  "
+              f"mean={sum(snrs)/len(snrs):.1f} dB")
         if auto:
-            print(f"  Tryby detekcji: carrier={n_carrier_mode}  OQPSK={n_oqpsk_mode}")
+            print(f"  Detection modes: carrier={n_carrier_mode}  OQPSK={n_oqpsk_mode}")
 
     return measurements
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Zapis TDM
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# TDM output
+# ---------------------------------------------------------------------------
 
 def write_tdm(measurements, output_path, station_name, center_freq_hz,
               integration_sec, originator=None, dsn_station=None, comment=None,
               participant_1=None):
-    """
-    Zapisuje plik TDM CCSDS v2.0 KVN zgodny z FDSS-III-109-0044.
-    """
+    """Write CCSDS TDM v2.0 KVN file."""
     if not measurements:
-        raise ValueError("Brak pomiarow do zapisania")
+        raise ValueError("No measurements to write")
 
-    freq_offset = round(center_freq_hz)   # FREQ_OFFSET w Hz (calkow.)
+    freq_offset = round(center_freq_hz)
     t_start = measurements[0][0]
     t_stop  = measurements[-1][0]
     now_utc = datetime.now(timezone.utc)
@@ -741,16 +733,16 @@ def write_tdm(measurements, output_path, station_name, center_freq_hz,
 
     dur = (t_stop - t_start).total_seconds()
     print(f"\n{'='*64}")
-    print(f"  ZAPISANO TDM : {output_path}")
-    print(f"  Pomiarow     : {len(measurements)}")
-    print(f"  Czas         : {dur:.0f} s ({dur/60:.1f} min)")
-    print(f"  Tryb         : {'3-way ('+dsn_station+')' if dsn_station else '1-way'}")
+    print(f"  TDM written  : {output_path}")
+    print(f"  Measurements : {len(measurements)}")
+    print(f"  Duration     : {dur:.0f} s ({dur/60:.1f} min)")
+    print(f"  Mode         : {'3-way ('+dsn_station+')' if dsn_station else '1-way'}")
     print(f"{'='*64}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Diagnostyczny wykres widma (opcjonalny, wymaga matplotlib)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Optional diagnostic spectrum plot
+# ---------------------------------------------------------------------------
 
 def plot_spectrum(iq, sample_rate, center_freq, output_png,
                  fft_size=65536, n_sub=50, duration_sec=60.0):
@@ -759,11 +751,11 @@ def plot_spectrum(iq, sample_rate, center_freq, output_png,
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
     except ImportError:
-        print("  [INFO] matplotlib niedostepny – pomijam wykres")
+        print("  [INFO] matplotlib not available -- skipping plot")
         return
 
     n = min(len(iq), int(sample_rate * duration_sec))
-    print(f"  Generuje widmo ({n/sample_rate:.0f} s, FFT={fft_size}, sub={n_sub})...")
+    print(f"  Computing spectrum ({n/sample_rate:.0f} s, FFT={fft_size}, sub={n_sub})...")
 
     psd   = welch_psd(iq[:n], fft_size, n_sub)
     freqs = np.fft.fftshift(np.fft.fftfreq(fft_size, 1.0/sample_rate)) / 1e3  # kHz
@@ -771,7 +763,7 @@ def plot_spectrum(iq, sample_rate, center_freq, output_png,
 
     fig, ax = plt.subplots(figsize=(14, 5))
     ax.plot(freqs, psd_s, lw=0.5, color="steelblue")
-    ax.set_xlabel("Offset od center [kHz]")
+    ax.set_xlabel("Offset from center [kHz]")
     ax.set_ylabel("PSD [dB rel.]")
     ax.set_title(
         f"Welch PSD  |  {center_freq/1e6:.4f} MHz  |  "
@@ -784,18 +776,18 @@ def plot_spectrum(iq, sample_rate, center_freq, output_png,
     for dr, col in zip(ORION_DATA_RATES_HZ, colors):
         for sign in (+1, -1):
             ax.axvline(sign*dr/1e3, color=col, lw=0.8, ls="--", alpha=0.5,
-                       label=f"±{dr/1e3:.0f}k sideband" if sign==1 else None)
+                       label=f"+-{dr/1e3:.0f}k sideband" if sign==1 else None)
     ax.axvline(0, color="lime", lw=1.0, ls=":", label="DC/center")
     ax.legend(fontsize=7, ncol=4)
     plt.tight_layout()
     plt.savefig(str(output_png), dpi=120)
     plt.close()
-    print(f"  Widmo: {output_png}")
+    print(f"  Spectrum saved: {output_png}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # CLI
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
 def build_parser():
     p = argparse.ArgumentParser(
@@ -803,73 +795,73 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--input",  "-i", required=True,
-                   help=".sigmf-meta  LUB  .raw/.bin/.iq (GQRX)")
-    p.add_argument("--freq",  type=float, help="Czestotliwosc centralna [Hz]")
+                   help=".sigmf-meta  OR  .raw/.bin/.iq (GQRX)")
+    p.add_argument("--freq",  type=float, help="Center frequency [Hz]")
     p.add_argument("--rate",  type=float, help="Sample rate [Sps]")
-    p.add_argument("--start", type=str,   help="Start nagrania (ISO-8601 UTC)")
+    p.add_argument("--start", type=str,   help="Recording start time (ISO-8601 UTC)")
     p.add_argument("--dtype", type=str,
                    choices=["cf32_le","cf32_be","ci16_le","ci16_be","ci8","cu8","cf64_le"],
-                   help="Typ danych IQ (domyslnie: cf32_le)")
+                   help="IQ data type (default: cf32_le)")
     p.add_argument("--station",    "-s", required=True,
-                   help="Nazwa stacji (np. SP5ABC_YAGI9M)")
+                   help="Station callsign or name (e.g. SP5LOT)")
     p.add_argument("--originator", type=str)
     p.add_argument("--dsn-station", type=str,
-                   help="Stacja DSN uplink (np. DSS-26) → tryb 3-way")
+                   help="DSN uplink station name (e.g. DSS-26) -> 3-way mode")
     p.add_argument("--integration", type=float, default=1.0,
-                   help="Czas integracji [s] (NASA: 1 lub 10, domyslnie: 1)")
+                   help="Integration interval [s] (NASA: 1 or 10, default: 1)")
     p.add_argument("--fft-size",    type=int,   default=65536,
-                   help="Rozmiar FFT (domyslnie: 65536)")
+                   help="FFT window size (default: 65536)")
     p.add_argument("--welch-sub",   type=int,   default=20,
                    help=(
-                       "Liczba sub-blokow Welcha [domyslnie: 20]. "
-                       "Wiecej = lepszy SNR dla slabych sygnalow. "
-                       "Przy malej antenie sprobuj 50-200."
+                       "Number of Welch sub-blocks [default: 20]. "
+                       "More = better SNR for weak signals. "
+                       "With a small antenna try 50-200."
                    ))
     p.add_argument("--min-snr",     type=float, default=3.0,
-                   help="Min SNR [dB] do akceptacji pomiaru (domyslnie: 3.0)")
+                   help="Minimum SNR [dB] to accept a measurement (default: 3.0)")
     p.add_argument("--search-bw",   type=float, default=None,
-                   help="Pasmo wyszukiwania nosnej [Hz]")
+                   help="Carrier search bandwidth [Hz]")
     p.add_argument("--carrier-hint", type=float, default=None,
                    help=(
-                       "Przyblizony offset nosnej [Hz] od center. "
-                       "Jesli wiesz gdzie jest sygnal na wodospadzie – "
-                       "podaj tu (np. --carrier-hint -15000 = 15 kHz ponizej center). "
-                       "Bardzo pomaga przy slabym sygnale!"
+                       "Approximate carrier offset [Hz] from center. "
+                       "If you can see the signal on a waterfall, enter its offset here "
+                       "(e.g. --carrier-hint -15000 = 15 kHz below center). "
+                       "Very helpful for weak signals!"
                    ))
     p.add_argument("--hint-bw", type=float, default=50_000,
                    help=(
-                       "Polszerokos pasma wyszukiwania wokol --carrier-hint [Hz] "
-                       "(domyslnie 50000 = ±50 kHz). Zwez jesli w poblizu nośnej "
-                       "sa silne sidebands, np. --hint-bw 15000."
+                       "Half-bandwidth around --carrier-hint [Hz] "
+                       "(default 50000 = +/-50 kHz). Narrow this if strong sidebands "
+                       "are near the carrier, e.g. --hint-bw 15000."
                    ))
     p.add_argument("--no-excl-sidebands", action="store_true",
-                   help="NIE wyklucz obszarow sideband przy szukaniu nosnej")
+                   help="Do not exclude PCM/PM/NRZ sideband regions from carrier search")
     p.add_argument("--oqpsk", action="store_true",
                    help=(
-                       "Tryb OQPSK/suppressowana nośna (Artemis II). "
-                       "Podnosi IQ do 4. potęgi przed Welchem (M-th power carrier recovery), "
-                       "usuwa modulację QPSK i ujawnia nośną jako CW na 4×Δf. "
-                       "Wynik dzielony przez 4. Użyj z --no-excl-sidebands."
+                       "OQPSK suppressed-carrier mode (Artemis II). "
+                       "Raises IQ to 4th power before Welch (M-th power carrier recovery), "
+                       "removing QPSK modulation and revealing the carrier as CW at 4*delta_f. "
+                       "Result divided by 4. Use with --no-excl-sidebands."
                    ))
     p.add_argument("--auto", action="store_true",
                    help=(
-                       "Auto-detekcja modulacji. Dla każdego bloku próbuje najpierw "
-                       "wykryć nośną CW (KPLO, LRO, Artemis I), a jeśli SNR za niski — "
-                       "przełącza na tryb OQPSK IQ^4 (Artemis II). "
-                       "Przydatne gdy nie wiadomo jakiego sygnału się spodziewać."
+                       "Auto-detect modulation per block. Tries direct CW carrier search "
+                       "(KPLO, LRO, Artemis I) first; if SNR is too low, falls back to "
+                       "OQPSK IQ^4 recovery (Artemis II). "
+                       "Useful when the signal type is unknown."
                    ))
     p.add_argument("--max-samples",  type=int,  default=None,
-                   help="Max probek do zaladowania (do testow na duzych plikach)")
+                   help="Load only first N samples (for testing on large files)")
     p.add_argument("--skip-samples", type=int,  default=None,
-                   help="Pomij pierwszych N probek (do testowania srodka pliku)")
-    p.add_argument("--output",  "-o", default=None, help="Plik wyjsciowy TDM")
+                   help="Skip first N samples (for testing mid-file segments)")
+    p.add_argument("--output",  "-o", default=None, help="Output TDM filename")
     p.add_argument("--participant-1", type=str, default=None,
                    help="Spacecraft name for PARTICIPANT_1 (default: ORION)")
     p.add_argument("--comment", type=str)
     p.add_argument("--plot", action="store_true",
-                   help="Zapisz widmo Welcha do PNG (wymaga matplotlib)")
+                   help="Save Welch spectrum plot to PNG (requires matplotlib)")
     p.add_argument("--no-interactive", action="store_true",
-                   help="Wyłącz interaktywną diagnostykę i pasek postępu (dla skryptów/cron)")
+                   help="Disable interactive diagnostics and progress bar (for scripts/cron)")
     return p
 
 
@@ -879,9 +871,9 @@ def main():
 
     inp = Path(args.input)
     if not inp.exists():
-        sys.exit(f"BLAD: Nie znaleziono: {inp}")
+        sys.exit(f"ERROR: File not found: {inp}")
 
-    # ── Wykryj format ──────────────────────────────────────────────────────
+    # -- Detect format ------------------------------------------------------
     suffix   = inp.suffix.lower()
     is_sigmf = suffix == ".sigmf-meta"
     is_gqrx  = suffix in (".raw", ".bin", ".iq")
@@ -897,7 +889,7 @@ def main():
     if is_sigmf:
         data_path = inp.with_suffix(".sigmf-data")
         if not data_path.exists():
-            sys.exit(f"BLAD: Brak pliku danych: {data_path}")
+            sys.exit(f"ERROR: Data file not found: {data_path}")
         print(f"[SigMF] {inp.name}")
         info = read_sigmf_meta(inp)
         print(f"  Datatype  : {info['datatype']}")
@@ -905,7 +897,7 @@ def main():
         print(f"  Freq      : {info['center_freq']/1e6:.6f} MHz")
         if info["start_time"]:
             print(f"  Start     : {info['start_time'].isoformat()}")
-        print(f"\nLaduje IQ z: {data_path}")
+        print(f"\nLoading IQ from: {data_path}")
         iq = load_iq(data_path, info["datatype"], args.max_samples, args.skip_samples)
     else:
         data_path = inp
@@ -915,13 +907,13 @@ def main():
         info.setdefault("datatype", dt_str)
         print(f"[GQRX] {inp.name}")
         if fn_info:
-            print(f"  Z nazwy pliku: freq={info.get('center_freq',0)/1e6:.3f} MHz  "
+            print(f"  From filename: freq={info.get('center_freq',0)/1e6:.3f} MHz  "
                   f"rate={info.get('sample_rate',0)/1e6:.3f} Msps  "
                   f"start={info.get('start_time','?')}")
-        print(f"\nLaduje IQ z: {data_path}")
+        print(f"\nLoading IQ from: {data_path}")
         iq = load_iq(data_path, info["datatype"], args.max_samples, args.skip_samples)
 
-    # ── Override z CLI ─────────────────────────────────────────────────────
+    # -- CLI overrides ------------------------------------------------------
     if args.freq:  info["center_freq"] = args.freq
     if args.rate:  info["sample_rate"] = args.rate
     if args.start: info["start_time"]  = _parse_dt(args.start)
@@ -931,13 +923,13 @@ def main():
     missing = [k for k in ("center_freq","sample_rate","start_time") if not info.get(k)]
     if missing:
         sys.exit(
-            "BLAD – brakuje metadanych: " + ", ".join(missing) +
-            "\nUzyj: --freq, --rate, --start"
+            "ERROR -- missing metadata: " + ", ".join(missing) +
+            "\nProvide: --freq, --rate, --start"
         )
 
     cf, sr, t0 = info["center_freq"], info["sample_rate"], info["start_time"]
 
-    # ── Opcjonalny wykres ─────────────────────────────────────────────────
+    # -- Optional spectrum plot ---------------------------------------------
     if args.plot:
         plot_out = Path(args.output or f"{args.station}_spectrum").with_suffix(".png")
         plot_spectrum(iq, sr, cf, plot_out,
@@ -945,7 +937,7 @@ def main():
                       n_sub=50,
                       duration_sec=min(120.0, len(iq)/sr))
 
-    # ── Główne przetwarzanie ───────────────────────────────────────────────
+    # -- Main processing ----------------------------------------------------
     meas = process_iq(
         iq, sr, cf, t0,
         integration_sec = args.integration,
@@ -962,11 +954,11 @@ def main():
     )
 
     if not meas:
-        print("\nBLAD: Brak pomiarow – sygnal za slaby lub zly prog SNR.")
-        print("Sprobuj: --min-snr 1.5  --welch-sub 100  --carrier-hint <Hz>")
+        print("\nERROR: No measurements -- signal too weak or SNR threshold too high.")
+        print("Try: --min-snr 1.5  --welch-sub 100  --carrier-hint <Hz>")
         sys.exit(1)
 
-    # ── Zapis TDM ─────────────────────────────────────────────────────────
+    # -- Write TDM ----------------------------------------------------------
     out = Path(args.output) if args.output else \
           Path(f"{args.station}_{t0.strftime('%Y%m%d_%H%M%S')}.tdm")
 
@@ -982,9 +974,9 @@ def main():
               args.originator, args.dsn_station, args.comment or auto_cmt,
               participant_1=args.participant_1)
 
-    print(f"\nNazwa wg konwencji NASA:")
+    print(f"\nNASA naming convention:")
     print(f"  {args.station}_Antenna1_{t0.strftime('%Y%m%d%H%M%S')}.tdm")
-    print(f"\nAby przeslac plik do NASA, skontaktuj sie z programem Artemis Amateur Tracking.")
+    print(f"\nTo submit to NASA, contact the Artemis Amateur Tracking program.")
 
 
 if __name__ == "__main__":
