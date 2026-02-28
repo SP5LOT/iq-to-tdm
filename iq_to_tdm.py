@@ -604,10 +604,11 @@ def process_iq(
             n_ok = len(measurements)
             accept_pct = n_ok / (i + 1) * 100
             status = "✓" if accepted else "✗"
+            mode_indicator = f"[{block_mode}] " if auto else ""
             bw = 28
             filled = int(bw * (i + 1) / n_blocks)
             bar = '█' * filled + '░' * (bw - filled)
-            print(f"\r  {status} [{bar}] {i+1}/{n_blocks} | "
+            print(f"\r  {status} {mode_indicator}[{bar}] {i+1}/{n_blocks} | "
                   f"ok:{n_ok}({accept_pct:.0f}%) | "
                   f"off:{offset:+.0f}Hz | SNR:{snr:.1f}dB | {eta_str}   ",
                   end='', flush=True)
