@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Porównanie KPLO TDM vs JPL Horizons range-rate → Doppler."""
+"""Compare KPLO TDM vs JPL Horizons range-rate -> Doppler."""
 
 import re
 import urllib.request
@@ -32,7 +32,7 @@ def parse_tdm(path):
 
 
 def query_horizons():
-    """Pobierz range-rate KPLO z JPL Horizons dla lokalizacji SQ3DHO."""
+    """Fetch KPLO range-rate from JPL Horizons for SQ3DHO observer location."""
     params = {
         'format':       'json',
         'COMMAND':      "'-155'",
@@ -57,7 +57,7 @@ def query_horizons():
 
     result = data.get('result', '')
 
-    # Parsuj wiersze tabeli: $$SOE ... $$EOE
+    # Parse table rows: $$SOE ... $$EOE
     rows = []
     in_data = False
     for line in result.splitlines():
@@ -68,7 +68,7 @@ def query_horizons():
             break
         if not in_data:
             continue
-        # Format: " 2026-Feb-21 15:47 *m  0.002...  -0.274..."
+        # Format: " 2026-Feb-21 15:47 *m  0.002...  -0.274..."  (delta_AU, deldot km/s)
         m = re.match(
             r'\s*(\d{4}-\w{3}-\d{2}\s+\d{2}:\d{2})'
             r'\s+\S+\s+([\d.]+)\s+([-\d.]+)',
@@ -77,35 +77,35 @@ def query_horizons():
         if m:
             dt = datetime.strptime(m.group(1), '%Y-%b-%d %H:%M').replace(tzinfo=timezone.utc)
             delta_au = float(m.group(2))
-            deldot   = float(m.group(3))   # km/s, pozytywny = oddala się
+            deldot   = float(m.group(3))   # km/s, positive = receding
             rows.append((dt, delta_au, deldot))
 
-    print(f"Pobrano {len(rows)} wierszy z Horizons")
+    print(f"Fetched {len(rows)} rows from Horizons")
     return rows
 
 
 def main():
-    # ── Wczytaj TDM ──────────────────────────────────────────────────────────
+    # -- Load TDM -------------------------------------------------------------
     tdm_times, tdm_freqs = parse_tdm('examples/kplo_20260221.tdm')
     active = [(t, f) for t, f in zip(tdm_times, tdm_freqs) if abs(f) > 10]
-    print(f"TDM aktywne pomiary: {len(active)}")
+    print(f"TDM active measurements: {len(active)}")
 
-    # ── Pobierz Horizons ──────────────────────────────────────────────────────
+    # -- Fetch Horizons -------------------------------------------------------
     hor = query_horizons()
     if not hor:
-        print("Brak danych Horizons!")
+        print("No Horizons data!")
         return
 
-    # ── Przelicz deldot → Doppler offset ─────────────────────────────────────
-    # deldot > 0 → oddala się → f_received < f_center → ujemny offset
-    # deldot < 0 → zbliża się → f_received > f_center → dodatni offset
+    # -- Convert deldot -> Doppler offset -------------------------------------
+    # deldot > 0 -> receding -> f_received < f_center -> negative offset
+    # deldot < 0 -> approaching -> f_received > f_center -> positive offset
     hor_dop = [(t, -deldot * CENTER_FREQ / C_KMS) for t, _, deldot in hor]
 
-    print("\n--- Pierwsze 5 wierszy Horizons → Doppler ---")
+    print("\n--- First 5 Horizons rows -> Doppler ---")
     for t, d in hor_dop[:5]:
         print(f"  {t.strftime('%H:%M')} UTC  dop={d:+.1f} Hz")
 
-    # ── Dopasuj po czasie (±30s) ──────────────────────────────────────────────
+    # -- Match by time (+-60s) ------------------------------------------------
     pairs = []
     for t_tdm, f_tdm in active:
         best_dt, best_hor = None, None
@@ -118,7 +118,7 @@ def main():
             pairs.append((t_tdm, f_tdm, best_hor, f_tdm - best_hor))
 
     if not pairs:
-        print("Brak dopasowań!")
+        print("No matching pairs found!")
         return
 
     diffs = [p[3] for p in pairs]
@@ -126,16 +126,16 @@ def main():
     residuals = [d - dc_offset for d in diffs]
     rms_residual = (sum(r**2 for r in residuals) / len(residuals)) ** 0.5
 
-    print(f"\n--- Porównanie TDM vs Horizons ({len(pairs)} par) ---")
+    print(f"\n--- TDM vs Horizons comparison ({len(pairs)} pairs) ---")
     print(f"  DC offset (TDM - Horizons): {dc_offset:+.1f} Hz")
-    print(f"  → SDR center vs KPLO nominal: {CENTER_FREQ/1e6:.4f} MHz vs "
+    print(f"  -> SDR center vs KPLO nominal: {CENTER_FREQ/1e6:.4f} MHz vs "
           f"{(CENTER_FREQ + dc_offset)/1e6:.4f} MHz")
-    print(f"  RMS residual po usunięciu DC: {rms_residual:.1f} Hz")
-    print(f"\n  Pierwsze 10 par (UTC | TDM | Horizons+DC | residual):")
+    print(f"  RMS residual after removing DC: {rms_residual:.1f} Hz")
+    print(f"\n  First 10 pairs (UTC | TDM | Horizons+DC | residual):")
     for (t, ft, fh, d), r in zip(pairs[:10], residuals[:10]):
         print(f"  {t.strftime('%H:%M:%S')}  TDM={ft:+.1f}  Hor={fh+dc_offset:+.1f}  res={r:+.1f} Hz")
 
-    # ── Wykres ────────────────────────────────────────────────────────────────
+    # -- Plot -----------------------------------------------------------------
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
 
@@ -144,7 +144,7 @@ def main():
                  fontsize=12, fontweight='bold')
 
     hor_t = [t for t, d in hor_dop]
-    # Horizons przesunięty o DC offset (różnica SDR center vs KPLO nominal)
+    # Horizons shifted by DC offset (SDR center vs KPLO nominal frequency difference)
     hor_f_shifted = [d + dc_offset for t, d in hor_dop]
     ax.plot(hor_t, hor_f_shifted, color='steelblue', linewidth=2.0,
             label=f'JPL Horizons (shifted +{dc_offset:.0f} Hz, SDR tuning offset)')
@@ -167,7 +167,7 @@ def main():
 
     plt.tight_layout()
     plt.savefig('kplo_vs_horizons.png', dpi=150, bbox_inches='tight')
-    print("\nZapisano: kplo_vs_horizons.png")
+    print("\nSaved: kplo_vs_horizons.png")
 
 
 if __name__ == '__main__':
