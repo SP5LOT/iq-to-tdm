@@ -88,13 +88,13 @@ re-running the converter on the same file produces bit-identical output.
 
 | File | Type | Description |
 |---|---|---|
+| `small.sigmf-meta` | SigMF metadata | **Primary validation.** CAMRAS IQ clip, Artemis I DRO departure burn, 2022-12-01 21:42 UTC |
+| `generated_small.tdm` | CCSDS TDM v2.0 | Output from `small.sigmf-meta`; Doppler -45627.5 Hz, cross-checked ~10 Hz vs CAMRAS single-FFT |
 | `camras-2022_11_19_10_07_16_2216.500MHz_2.0Msps_ci16_le.sigmf-meta` | SigMF metadata | CAMRAS IQ recording, Artemis I, 2022-11-19 10:07 UTC |
-| `CAMRAS_Orion_20221119_v1.tdm` | CCSDS TDM v2.0 | CAMRAS original TDM, same day 12:30–13:02 UTC |
-| `CAMRAS_20221119_100716_SP5LOT.tdm` | CCSDS TDM v2.0 | Output of this converter from the CAMRAS IQ above |
+| `CAMRAS_20221119_100716_SP5LOT.tdm` | CCSDS TDM v2.0 | Output from the IQ above; Doppler -50142 Hz, cross-checked ~6 Hz vs CAMRAS single-FFT |
+| `CAMRAS_Orion_20221119_v1.tdm` | CCSDS TDM v2.0 | CAMRAS original TDM, 2022-11-19 12:30–13:02 UTC. Format reference only — different time window, no matching IQ available publicly |
 | `gqrx_20260221_151916_2260790300_125000_fc.sigmf-meta` | SigMF metadata | SP5LOT IQ recording, KPLO/Danuri, 2026-02-21 (recorded by SQ3DHO) |
-| `kplo_20260221.tdm` | CCSDS TDM v2.0 | Output of this converter from the SP5LOT KPLO IQ above |
-| `small.sigmf-meta` | SigMF metadata | CAMRAS IQ clip, Artemis I DRO departure burn, 2022-12-01 |
-| `generated_small.tdm` | CCSDS TDM v2.0 | Output of this converter from the small clip above |
+| `kplo_20260221.tdm` | CCSDS TDM v2.0 | Output from the KPLO IQ above; 6851 measurements, reproducible bit-for-bit |
 
 Note: `.sigmf-data` binary IQ files are not included due to size (77 MB and 6.4 GB).
 The CAMRAS IQ data files are publicly available from Stichting CAMRAS under CC BY 4.0.
