@@ -88,6 +88,21 @@ re-running the converter on the same file produces bit-identical output.
 Right: active tracking window (4385 measurements, 15:47–17:05 UTC) — smooth
 +34210 → +28123 Hz drift as KPLO moved across the sky.*
 
+### Cross-validation against JPL Horizons
+
+The measured Doppler profile was compared against JPL Horizons range-rate predictions
+(QUANTITIES=20, `deldot` in km/s) computed for the SQ3DHO observer location.
+
+![KPLO TDM vs JPL Horizons](examples/kplo_vs_horizons.png)
+
+The two curves are nearly identical in shape. A constant DC offset of **+32000 Hz**
+is present because the SDR was tuned to 2260.7903 MHz while KPLO's actual nominal
+downlink frequency is ~2260.8223 MHz. This is an SDR tuning offset, not a converter
+error — the TDM absolute frequency (`FREQ_OFFSET + RECEIVE_FREQ_2`) is correct.
+
+After removing the DC offset, the **RMS residual is 96.6 Hz** across 4385 measurements
+— consistent with HackRF One frequency stability at S-band.
+
 ---
 
 ## Repository Contents — `examples/`
