@@ -474,7 +474,6 @@ def process_iq(
     interactive     = True,
     oqpsk           = False,
     auto            = False,
-    adaptive        = False,
 ):
     """
     Slide integration window and collect carrier frequency measurements.
@@ -515,8 +514,7 @@ def process_iq(
         print(f"  Mode             : OQPSK (IQ^4, /4)")
     else:
         print(f"  Mode             : carrier (Welch)")
-    if adaptive:
-        print(f"  Adaptive         : yes (auto-increase welch-sub if acceptance < 70%)")
+    print(f"  Adaptive         : yes (auto-increase welch-sub if acceptance < 70%)")
     print(f"  Blocks           : {n_blocks}")
     print(f"{'='*64}")
 
@@ -529,8 +527,8 @@ def process_iq(
 
     use_tty = interactive and sys.stdout.isatty() and sys.stdin.isatty()
     probe_n = min(20, max(10, n_blocks // 10))
-    # Probe phase runs if: interactive OR adaptive (adaptive works without TTY)
-    probe_done = (not interactive and not adaptive) or (probe_n >= n_blocks)
+    # Probe phase always runs (adaptive welch-sub tuning works even without TTY)
+    probe_done = probe_n >= n_blocks
 
     t0_proc = time.time()
 
@@ -635,7 +633,7 @@ def process_iq(
             n_ok_probe = sum(1 for _, _, s in probe_raw if s >= min_snr_db)
             accept_rate = n_ok_probe / max(probe_n, 1)
 
-            if adaptive and accept_rate < 0.70:
+            if accept_rate < 0.70:
                 # Automatically increase welch sub-blocks until acceptance >= 70%
                 # or we hit the cap (500). Re-process probe blocks each time.
                 MAX_ADAPTIVE_SUB = 500
@@ -937,12 +935,6 @@ def build_parser():
                        "OQPSK IQ^4 recovery (Artemis II). "
                        "Useful when the signal type is unknown."
                    ))
-    p.add_argument("--adaptive", action="store_true",
-                   help=(
-                       "Automatically increase --welch-sub if the probe-phase acceptance "
-                       "rate is below 70%%. Tries 4x multiplier up to 500 sub-blocks. "
-                       "Useful for weak signals when you don't know how much averaging is needed."
-                   ))
     p.add_argument("--max-samples",  type=int,  default=None,
                    help="Load only first N samples (for testing on large files)")
     p.add_argument("--skip-samples", type=int,  default=None,
@@ -1044,7 +1036,6 @@ def main():
         interactive     = not args.no_interactive,
         oqpsk           = args.oqpsk,
         auto            = args.auto,
-        adaptive        = args.adaptive,
     )
 
     if not meas:
