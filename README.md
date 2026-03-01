@@ -160,6 +160,23 @@ frequency stability at S-band.
 *Left: full 1 h 54 min pass — classic satellite Doppler arc.
 Right: active tracking window (4385 measurements, 15:47–17:05 UTC).*
 
+### 4 — Additional CAMRAS Artemis I recordings (Nov–Dec 2022)
+
+Further cross-validation against CAMRAS reference TDMs from
+[gitlab.camras.nl/dijkema/artemistracking](https://gitlab.camras.nl/dijkema/artemistracking/)
+using additional IQ recordings from
+[data.camras.nl/artemis1](https://data.camras.nl/artemis1/):
+
+| IQ recording | Rate | Reference TDM | n | RMS |
+|---|---|---|---|---|
+| camras-2022_11_30_18_13_11_2216.500MHz | 2.0 Msps | CAMRAS_Orion_20221130_quad_v2.tdm | 60 | 24.0 Hz |
+| camras-2022_11_30_19_39_43_2216.500MHz | 2.0 Msps | CAMRAS_Orion_20221130_quad_v2.tdm | 60 | **4.5 Hz** |
+| camras-2022_12_02_22_09_40_2216.500MHz | 2.0 Msps | CAMRAS_Orion_20221202_quad_v1.tdm | 30 | **0.9 Hz** |
+| camras-2022_12_10_21_01_30_2216.500MHz | 4.5 Msps | CAMRAS_Orion_20221210_quad_v1.tdm | 10 | **0.3 Hz** |
+
+RMS = root mean square residual after removing mean offset between our Doppler curve
+and the CAMRAS reference. Best result: **0.3 Hz RMS** (Dec 10).
+
 ---
 
 ## Repository Contents — `examples/`
