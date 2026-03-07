@@ -1427,8 +1427,9 @@ def main():
               args.originator, args.dsn_station, args.comment or auto_cmt,
               participant_1=args.participant_1)
 
-    print(f"\nNASA naming convention:")
-    print(f"  {args.station}_Antenna1_{t0.strftime('%Y%m%d%H%M%S')}.tdm")
+    p1 = args.participant_1 or "ORION"
+    print(f"\nSuggested filename:")
+    print(f"  {args.station}_{p1}_{t0.strftime('%Y%m%d_%H%M%S')}.tdm")
 
 
 if __name__ == "__main__":
