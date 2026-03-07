@@ -14,10 +14,11 @@ You recorded a spacecraft signal with your SDR. This tool reads the IQ file, fin
 carrier frequency in each second of the recording using signal processing, and writes a
 standard NASA file (TDM) with the Doppler shift over time.
 
-**It works automatically** — just point it at your `.sigmf-meta` file:
+**It works automatically** — just point it at your `.sigmf-meta` or `.wav` file:
 
 ```bash
 python iq_to_tdm.py --input recording.sigmf-meta --station MY_CALLSIGN --auto
+python iq_to_tdm.py --input "06-Mar-2026 011432.831 2271.222MHz.wav" --station MY_CALLSIGN
 ```
 
 The `--auto` flag makes the converter decide per second whether your signal has a direct
@@ -53,8 +54,8 @@ Artemis I OQPSK tracking (`quad` files).
 
 ## Features
 
-- Reads **SigMF** (`.sigmf-meta` + `.sigmf-data`) and **GQRX** raw recordings
-- Supported IQ formats: `cf32_le`, `cf64_le`, `ci16_le`, `ci8`, `cu8`
+- Reads **SigMF** (`.sigmf-meta` + `.sigmf-data`), **WAV** (SDR Console, SDR#, HDSDR, SDRuno), and **GQRX** raw recordings
+- Supported IQ formats: `cf32_le`, `cf64_le`, `ci16_le`, `ci8`, `cu8` (WAV: `cf32_le`, `ci16_le`, `cu8`)
 - Carrier detection via **Welch averaged periodogram** with parabolic sub-bin interpolation
   — gain of ~13 dB SNR with default 20 sub-blocks
 - **`--oqpsk`** mode: IQ⁴ suppressed-carrier recovery for OQPSK/BPSK signals (Artemis II)
@@ -62,6 +63,7 @@ Artemis I OQPSK tracking (`quad` files).
 - Outputs **CCSDS TDM v2.0 KVN** (`RECEIVE_FREQ_2`) ready for NASA submission
 - Memory-mapped I/O for files larger than 2 GB
 - Optional carrier hint (`--carrier-hint`, `--hint-bw`) for recordings with nearby interference
+- Automatic SNR threshold lowering for weak signals (median probe SNR ≥ 1.5 dB)
 - Interactive probe phase with automatic parameter suggestions (disable with `--no-interactive`)
 - Optional Welch spectrum plot to PNG (`--plot`)
 
@@ -224,6 +226,20 @@ automatically switches to OQPSK IQ⁴ recovery. The progress bar shows the decis
 
 Summary at end: `Detection modes: carrier=59  OQPSK=1`
 
+### WAV IQ file (SDR Console, SDR#, HDSDR, SDRuno)
+
+```bash
+python iq_to_tdm.py \
+    --input  "06-Mar-2026 011432.831 2271.222MHz.wav" \
+    --station MY_CALLSIGN \
+    --participant-1 LRO \
+    --output lro_tracking.tdm
+```
+
+WAV files are auto-detected by the `.wav` extension. Center frequency, sample rate and
+start time are extracted from the `auxi` chunk (SDR Console XML or SDRuno binary) or from
+the filename. Supports standard WAV (RIFF) and RF64 for files larger than 4 GB.
+
 ### KPLO/Danuri or any CW carrier signal
 
 ```bash
@@ -279,12 +295,15 @@ python iq_to_tdm.py \
 Note: `--oqpsk` incurs ~12 dB SNR penalty vs direct carrier detection. For weak signals:
 `--integration 5.0 --welch-sub 100`
 
-### Weak signal — automatic averaging adjustment
+### Weak signal — automatic averaging and SNR adjustment
 
 The converter automatically finds the right amount of averaging.
 It processes the first ~10% of blocks as a probe, and if the acceptance rate is below 70%,
 it automatically increases `--welch-sub` by 4× (up to 500) and re-processes the probe.
-No extra option needed — this always happens:
+
+If the signal is still too weak for the default SNR threshold (3.0 dB) but consistently
+present (median probe SNR ≥ 1.5 dB), the converter **automatically lowers the threshold**.
+No extra options needed — this always happens:
 
 ```bash
 python iq_to_tdm.py \
@@ -294,12 +313,14 @@ python iq_to_tdm.py \
     --output output.tdm
 ```
 
-Example output when signal is weak:
+Example output when signal is weak (e.g. LRO on HackRF):
 ```
-  [adaptive] acceptance 20% < 70% -- increasing welch-sub: 20 -> 80 (gain ~19.0 dB)
-  [adaptive] acceptance 60% < 70% -- increasing welch-sub: 80 -> 320 (gain ~25.1 dB)
-  [adaptive] probe acceptance after adaptation: 9/10 (90%)
-  Continuing from block 11/60 with welch-sub=320...
+  [adaptive] acceptance 0% < 70% -- increasing welch-sub: 20 -> 80 (gain ~19.0 dB)
+  [adaptive] acceptance 0% < 70% -- increasing welch-sub: 80 -> 320 (gain ~25.1 dB)
+  [adaptive] acceptance 0% < 70% -- increasing welch-sub: 320 -> 500 (gain ~27.0 dB)
+  [adaptive] probe acceptance after adaptation: 0/20 (0%)
+  [adaptive] weak signal in probe (median SNR=2.0 dB) -- lowering min-snr: 3.0 -> 1.6 dB
+  Continuing from block 21/371 with welch-sub=500...
 ```
 
 ---
@@ -363,7 +384,7 @@ Periods with no detectable signal are reported as +0.000 Hz.
 ## All Options
 
 ```
---input,   -i   .sigmf-meta file or GQRX .sigmf-meta / raw file  [required]
+--input,   -i   .sigmf-meta, .wav, or GQRX .raw/.bin/.iq file     [required]
 --station, -s   Station callsign or name (e.g. SP5LOT)            [required]
 --output,  -o   Output TDM filename (auto-generated if omitted)
 --participant-1  Spacecraft name: ORION, KPLO, DANURI, etc.       [default: ORION]
