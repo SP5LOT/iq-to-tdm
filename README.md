@@ -4,7 +4,7 @@ Converts amateur radio SDR IQ recordings to NASA CCSDS Tracking Data Message (TD
 for submission to NASA Artemis II and lunar mission Doppler tracking programs.
 
 **Station:** SP5LOT — Warsaw, Poland
-**Missions:** Artemis I/II (Orion), KPLO/Danuri
+**Missions:** Artemis I/II (Orion), KPLO/Danuri, LRO
 
 ---
 
@@ -21,27 +21,34 @@ python iq_to_tdm.py --input recording.sigmf-meta --station MY_CALLSIGN --spacecr
 python iq_to_tdm.py --input "recording.wav" --station MY_CALLSIGN --spacecraft ORION
 ```
 
-The `--auto` flag makes the converter decide per second whether your signal has a direct
-carrier (KPLO, LRO, Artemis I) or a suppressed carrier requiring OQPSK recovery
-(Artemis II). You can see the decision live in the progress bar:
+The converter automatically detects the signal type (strong carrier, weak carrier, suppressed
+carrier) and selects the right processing method. No flags needed — it just works.
 
-```
-  ✓ [C] [████████████████████░░░░░░░░] 20/60 | ok:20(100%) | off:+519Hz | SNR:30.8dB | ETA 00:40
-  ✓ [C] [█████████████████████░░░░░░░] 21/60 | ok:21(100%) | off:+520Hz | SNR:30.7dB | ETA 00:39
-```
+If you also provide `--location`, the converter queries JPL Horizons after processing
+to validate your measurements and classify transponder segments (coherent vs non-coherent):
 
-`[C]` = carrier detected directly (CW tone in spectrum).
-`[Q]` = OQPSK IQ⁴ recovery used (suppressed-carrier signal, Artemis II style).
+```bash
+python iq_to_tdm.py --input recording.sigmf-meta --station MY_CALLSIGN \
+    --spacecraft LRO --location "52.15,21.19,120"
+```
 
 ---
 
-## Why Two Modes?
+## Detection Modes
 
-| Signal type | What you see in FFT | Method | Flag |
+The converter has four detection methods. In most cases you don't need to choose —
+auto-detect picks the right one:
+
+| Signal type | Method | When auto-detect uses it | Manual flag |
 |---|---|---|---|
-| KPLO, LRO, Artemis I | Sharp CW spike at Doppler offset | Welch periodogram | _(default)_ |
-| Artemis II (OQPSK) | No carrier spike — power spread by data | Raise IQ to 4th power (IQ⁴), divide result by 4 | `--oqpsk` |
-| Unknown | Don't know | Try CW first, fall back to IQ⁴ if SNR too low | `--auto` |
+| Strong CW carrier (KPLO, LRO, Artemis I) | Welch periodogram | Carrier found in probe (10 blocks) | _(default)_ |
+| Weak CW carrier (LRO on small antenna, SOHO) | Viterbi ridge tracker on spectrogram | No carrier in probe, signal found in coarse scan | `--weak` |
+| Suppressed carrier (Artemis II OQPSK) | IQ⁴ carrier recovery, per-block | OQPSK detected in probe | `--oqpsk` |
+| Suppressed + weak carrier | IQ⁴ + Viterbi ridge tracker | _(manual only)_ | `--oqpsk --weak` |
+
+**Auto-detect pipeline:** The converter probes the first 10 blocks with both CW and OQPSK
+methods. If neither finds a signal, it switches to weak mode — runs a coarse Viterbi scan
+to find the signal, then tracks it with full resolution. No manual flags needed.
 
 **OQPSK explained:** Artemis II uses OQPSK modulation — the carrier is suppressed by the
 data and disappears as a discrete spectral line. Raising the IQ samples to the 4th power
@@ -50,17 +57,29 @@ mathematically removes the data modulation (all four phase states 0°/90°/180°
 Doppler offset. This technique was also used by the CAMRAS Dwingeloo team for their
 Artemis I OQPSK tracking (`quad` files).
 
+**Viterbi ridge tracker:** For signals too weak for per-block detection (SNR < 3 dB),
+the converter builds a spectrogram (all blocks at once) and uses dynamic programming
+(Viterbi algorithm) to find the optimal frequency track through the noise. This
+accumulates SNR across the entire recording — even signals at 0 dB per block become
+detectable when the track spans hundreds of frames.
+
 ---
 
 ## Features
 
 - Reads **SigMF** (`.sigmf-meta` + `.sigmf-data`), **WAV** (SDR Console, SDR#, HDSDR, SDRuno), and **GQRX** raw recordings
 - Supported IQ formats: `cf32_le`, `cf64_le`, `ci16_le`, `ci8`, `cu8` (WAV: `cf32_le`, `ci16_le`, `cu8`)
+- **Automatic signal detection** — no manual mode selection needed (CW → OQPSK → Viterbi)
 - Carrier detection via **Welch averaged periodogram** with parabolic sub-bin interpolation
   — gain of ~13 dB SNR with default 20 sub-blocks
+- **Viterbi ridge tracker** for weak signals below per-block detection threshold
 - **`--oqpsk`** mode: IQ⁴ suppressed-carrier recovery for OQPSK/BPSK signals (Artemis II)
-- **`--auto`** mode: per-block automatic selection between CW and OQPSK
+- **`--oqpsk --weak`** combined mode: IQ⁴ + Viterbi for suppressed carrier at low SNR
 - Outputs **CCSDS TDM v2.0 KVN** (`RECEIVE_FREQ_2`) ready for NASA submission
+- **JPL Horizons validation** — when `--spacecraft` and `--location` are provided, compares
+  measured Doppler against ephemeris predictions and classifies coherent/non-coherent
+  transponder segments. Measured frequencies are never modified — only TDM metadata
+  (segment labels, turnaround ratio) is updated
 - Memory-mapped I/O for files larger than 2 GB
 - Optional carrier hint (`--carrier-hint`, `--hint-bw`) for recordings with nearby interference
 - Automatic SNR threshold lowering for weak signals (median probe SNR ≥ 1.5 dB)
@@ -79,7 +98,22 @@ python iq_to_tdm.py \
 ```
 
 That's it — the output TDM file is named automatically (`MY_CALLSIGN_LRO_20260306_001410.tdm`).
-Add `--location "52.23,21.01,110"` to embed your station coordinates in the TDM header.
+
+Add `--location` to enable JPL Horizons validation after processing:
+
+```bash
+python iq_to_tdm.py \
+    --input recording.sigmf-meta \
+    --station MY_CALLSIGN \
+    --spacecraft LRO \
+    --location "52.15,21.19,120"
+```
+
+This queries JPL Horizons for the expected Doppler, reports the RMS residual between
+your measurements and the ephemeris, and classifies transponder segments as coherent
+(2-way, DSN uplink active) or non-coherent (1-way, free-running oscillator).
+**Your measured frequencies are never changed** — only TDM metadata (segment boundaries,
+turnaround ratio) is updated based on the classification.
 
 ---
 
@@ -202,6 +236,54 @@ This validates:
 - Automatic SNR threshold lowering for weak signals
 - End-to-end pipeline: SDR Console WAV → TDM → spacecraft identification
 
+### 6 — LRO, SP5LOT 2026-03-12 — Viterbi weak signal + coherent/non-coherent segments
+
+IQ recording by SP5LOT (PlutoSDR + GPSDO, 1.5 Msps, 57 min, 2271.208 MHz, Warsaw).
+
+The signal had strong DC spike (24 dB) from the SDR and weak carrier (mean SNR 4.3 dB).
+Auto-detect found the carrier away from DC at +24912 Hz and tracked it with Viterbi:
+
+```
+  [auto-detect] CW probe near DC (median -92 Hz) + strong DC spike (24 dB)
+  [auto-detect] Scanning for signal away from DC...
+  [auto-detect] Found signal at +24912 Hz (accum SNR 24.2 dB, range 5659 Hz)
+```
+
+Result: **3404 measurements**, Doppler drift from +26165 Hz to −7862 Hz (34 kHz total —
+characteristic of a lunar orbiter pass).
+
+With `--spacecraft LRO --location "52.15,21.19,120"`, the converter queries JPL Horizons
+and automatically classifies the recording into two transponder segments:
+
+```
+  [validate] Segment 1: coherent (2-way) 05:35–06:20: 2677 pts, RMS=352 Hz, TX=2271.2196 MHz
+  [validate] Segment 2: non-coherent (1-way) 06:20–06:32: 727 pts, RMS=646 Hz, TX=2271.2108 MHz
+
+  [rewrite] Rewriting TDM with Horizons-classified transponder segments...
+
+  Segment: coherent — 2677 pts, 2676 s (44.6 min)
+  Segment: non-coherent — 727 pts, 726 s (12.1 min)
+```
+
+The two segments have different transmit frequencies (8.8 kHz apart) because:
+- **Coherent (2-way):** DSN uplink active — the spacecraft multiplies the received
+  frequency by 240/221, so the downlink is locked to the ground station
+- **Non-coherent (1-way):** no uplink — the spacecraft uses its free-running oscillator
+
+The TDM is rewritten with separate metadata blocks per segment. Coherent segments include
+`TURNAROUND_NUMERATOR = 240` / `TURNAROUND_DENOMINATOR = 221`. The measured frequencies
+themselves are unchanged — only the metadata labels are added.
+
+![LRO Doppler — SP5LOT 2026-03-12](examples/lro_mar12_doppler.png)
+
+*Left: receive frequency (MHz). Right: Doppler offset from SDR center (kHz).
+Blue = coherent (2-way), red = non-coherent (1-way). Transition at 44.6 min.*
+
+This validates:
+- Viterbi ridge tracker with DC spike avoidance (spectral subtraction)
+- Automatic transponder segment classification via JPL Horizons
+- Multi-segment CCSDS TDM v2.0 output with correct per-segment metadata
+
 ---
 
 ## Repository Contents — `examples/`
@@ -228,25 +310,18 @@ CAMRAS files are CC BY 4.0, Stichting CAMRAS, Dwingeloo.
 
 ## Usage Examples
 
-### Recommended: automatic mode for any recording
+### Recommended: just let it auto-detect
 
 ```bash
 python iq_to_tdm.py \
     --input  recording.sigmf-meta \
     --station MY_CALLSIGN \
-    --spacecraft ORION \
-    --auto
+    --spacecraft LRO \
+    --location "52.15,21.19,120"
 ```
 
-The converter tries direct carrier detection first; if the block SNR is too low, it
-automatically switches to OQPSK IQ⁴ recovery. The progress bar shows the decision live:
-
-```
-  ✓ [C] [████████████████████░░░░░░░░] 20/60 | ok:20(100%) | off:+520Hz | SNR:30.8dB | ETA 00:40
-  ✓ [Q] [█████████████████████░░░░░░░] 21/60 | ok:21(100%) | off:+510Hz | SNR: 5.2dB | ETA 00:39
-```
-
-Summary at end: `Detection modes: carrier=59  OQPSK=1`
+No mode flags needed. The converter probes the signal, picks the right method (CW, OQPSK,
+or Viterbi), processes the recording, and validates against JPL Horizons.
 
 ### WAV IQ file (SDR Console, SDR#, HDSDR, SDRuno)
 
@@ -310,8 +385,8 @@ python iq_to_tdm.py \
     --no-excl-sidebands
 ```
 
-Note: `--oqpsk` incurs ~12 dB SNR penalty vs direct carrier detection. For weak signals:
-`--integration 5.0 --welch-sub 100`
+Note: `--oqpsk` incurs ~12 dB SNR penalty vs direct carrier detection. For weak OQPSK
+signals (small antenna), combine with Viterbi: `--oqpsk --weak`
 
 ### Weak signal — automatic averaging and SNR adjustment
 
@@ -345,15 +420,22 @@ Example output when signal is weak (e.g. LRO on HackRF):
 ## Algorithm
 
 1. Load IQ samples; use `numpy.memmap` for files larger than 2 GB
-2. Split into non-overlapping integration windows (default 1.0 s)
-3. For each window: compute Welch averaged periodogram
-   (N sub-blocks with 50% overlap and Hanning window; SNR gain = 10 log₁₀(N) dB)
-4. _(OQPSK mode)_ Raise IQ to 4th power → data modulation cancels → pure CW at 4×Δf
-5. Parabolic interpolation around the FFT peak for sub-bin frequency accuracy
-6. _(OQPSK mode)_ Divide frequency offset by 4 → true Doppler offset
-7. Apply SNR threshold; optionally exclude PCM/PM/NRZ sideband regions
-8. Timestamp each measurement at the end of its integration window (`INTEGRATION_REF = END`)
-9. Write CCSDS TDM v2.0 KVN file
+2. Auto-detect signal type: probe first 10 blocks with CW and OQPSK methods
+3. **Strong signal path** (per-block):
+   - Split into non-overlapping integration windows (default 1.0 s)
+   - Compute Welch averaged periodogram (N sub-blocks, 50% overlap, Hanning; SNR gain = 10 log₁₀(N) dB)
+   - _(OQPSK)_ Raise IQ to 4th power → modulation cancels → CW at 4×Δf; divide by 4
+   - Parabolic interpolation around FFT peak for sub-bin frequency accuracy
+   - Apply SNR threshold; optionally exclude PCM/PM/NRZ sideband regions
+4. **Weak signal path** (Viterbi):
+   - Build spectrogram (all blocks); _(OQPSK+weak)_ apply IQ⁴ per block before PSD
+   - Spectral subtraction to remove DC spike and stationary interference
+   - Viterbi dynamic programming to find optimal frequency track through noise
+   - Per-block CW refinement at Viterbi positions for sub-Hz precision
+5. Timestamp each measurement at the end of its integration window (`INTEGRATION_REF = END`)
+6. Write CCSDS TDM v2.0 KVN file
+7. _(with `--spacecraft` + `--location`)_ Query JPL Horizons, classify transponder segments,
+   rewrite TDM with per-segment metadata if coherent/non-coherent transitions detected
 
 ---
 
@@ -406,7 +488,8 @@ Periods with no detectable signal are reported as +0.000 Hz.
 --output,  -o   Output TDM filename (auto-generated if omitted)
 --spacecraft     Spacecraft name: ORION, KPLO, LRO, DANURI, etc.  [default: ORION]
 --originator     ORIGINATOR field in TDM header                   [default: station]
---location       Station lat,lon,alt (e.g. 52.23,21.01,110) for TDM comment
+--location       Station lat,lon,alt (e.g. "52.15,21.19,120")
+                 When combined with --spacecraft, enables JPL Horizons validation
 --dsn-station    DSN uplink station name (3-way mode, e.g. DSS-26)
 --integration    Integration interval in seconds                  [default: 1.0]
 --fft-size       FFT window size (power of 2)                     [default: 65536]
@@ -417,6 +500,10 @@ Periods with no detectable signal are reported as +0.000 Hz.
 --hint-bw        Half-bandwidth around --carrier-hint [Hz]        [default: 50000]
 --no-excl-sidebands  Do not exclude PCM/PM/NRZ sideband regions
 --oqpsk          OQPSK suppressed-carrier mode (IQ⁴ /4) for Artemis II
+--weak           Weak signal mode (Viterbi ridge tracker on spectrogram)
+--oqpsk --weak   Combined: IQ⁴ carrier recovery + Viterbi tracking
+--max-drift      Max Doppler drift rate [Hz/s] for --weak mode    [default: 10]
+--weak-stack     Stack K frames before Viterbi tracking (SNR boost)[default: 1]
 --auto           Auto-detect per block: CW carrier first, OQPSK fallback
 --max-samples    Load only first N samples (for testing)
 --skip-samples   Skip first N samples (for testing mid-file segments)

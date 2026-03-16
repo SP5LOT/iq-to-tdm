@@ -45,6 +45,8 @@ import re
 import struct
 import sys
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -505,6 +507,7 @@ def welch_psd(iq_block, fft_size, n_sub):
 
     while pos + fft_size <= len(iq_block) and count < n_sub:
         seg  = iq_block[pos : pos + fft_size]
+        seg  = seg - np.mean(seg)   # DC removal per sub-block
         spec = np.fft.fft(seg * window, n=fft_size)
         psd += (np.abs(spec) ** 2) / wsum
         pos  += hop
@@ -527,6 +530,290 @@ def _parabolic(psd, k, fft_size, sr):
     return k * sr / fft_size
 
 
+# ---------------------------------------------------------------------------
+# Viterbi ridge tracker for weak / modulated signals
+# ---------------------------------------------------------------------------
+
+def _build_spectrogram(iq, sample_rate, fft_size, n_sub, spb, n_blocks,
+                       carrier_hint, hint_bw, search_bw, dc_excl=0.0,
+                       oqpsk=False):
+    """Build spectrogram matrix (n_blocks × n_freq_bins) within search window.
+
+    When oqpsk=True, each block is raised to the 4th power before Welch PSD
+    (M-th power carrier recovery). The freq_axis is in the IQ^4 domain (4×).
+
+    Returns:
+        psd_matrix : 2D array (n_blocks, n_mask_bins) — power in dB
+        freq_axis  : 1D array of offset frequencies [Hz] for masked bins
+        mask_idx   : indices into full FFT for the masked bins
+    """
+    freqs_full = np.fft.fftfreq(fft_size, d=1.0 / sample_rate)
+
+    # Build frequency mask (same logic as estimate_carrier)
+    if carrier_hint is not None:
+        mask = np.abs(freqs_full - carrier_hint) <= hint_bw
+    elif search_bw is not None:
+        mask = np.abs(freqs_full) <= search_bw / 2
+    else:
+        mask = np.abs(freqs_full) <= sample_rate * 0.40
+
+    # Exclude DC spike region if requested
+    if dc_excl > 0:
+        mask &= np.abs(freqs_full) > dc_excl
+
+    mask_idx = np.where(mask)[0]
+    freq_axis = freqs_full[mask_idx]
+
+    # Sort by frequency for clean output
+    order = np.argsort(freq_axis)
+    mask_idx = mask_idx[order]
+    freq_axis = freq_axis[order]
+
+    n_bins = len(mask_idx)
+    psd_matrix = np.zeros((n_blocks, n_bins), dtype=np.float64)
+
+    for i in range(n_blocks):
+        block = iq[i * spb : (i + 1) * spb]
+        if oqpsk:
+            block = (block.astype(np.complex128) ** 4).astype(np.complex64)
+            block = block - np.mean(block)
+        psd = welch_psd(block, fft_size, n_sub)
+        psd_matrix[i, :] = psd[mask_idx]
+
+    # Convert to dB
+    psd_matrix = 10.0 * np.log10(psd_matrix + 1e-30)
+
+    return psd_matrix, freq_axis, mask_idx
+
+
+def _smooth_kalman_rts(track_freq, track_snr, poly_order=3, sigma_clip=2.5,
+                       q_accel=0.1):
+    """Smooth Viterbi frequency track using outlier rejection + Kalman RTS.
+
+    Stage 1: Iterative sigma-clipping polynomial fit to reject outliers.
+    Stage 2: Kalman forward-backward (RTS) smoother with SNR-weighted
+             measurement noise — optimal batch estimator for smooth signals.
+
+    Args:
+        track_freq : raw frequency estimates per frame [Hz]
+        track_snr  : per-frame SNR [dB] (used to weight measurements)
+        poly_order : polynomial order for outlier rejection (default 3)
+        sigma_clip : rejection threshold in sigma units (default 2.5)
+        q_accel    : process noise — expected acceleration variance [Hz/step^2]
+                     Lower = smoother. For L1 objects ~0.1, lunar ~1.0.
+
+    Returns:
+        smoothed frequency track [Hz], same length as input
+    """
+    nf = len(track_freq)
+    t_idx = np.arange(nf, dtype=np.float64)
+
+    # --- Stage 1: outlier rejection via iterative sigma-clipping poly fit ---
+    mask = np.ones(nf, dtype=bool)
+    for _iteration in range(3):
+        if np.sum(mask) < poly_order + 2:
+            break
+        # Normalize time to [-1, 1] for numerical stability
+        t_norm = 2.0 * (t_idx[mask] - t_idx[mask][0]) / max(1, t_idx[mask][-1] - t_idx[mask][0]) - 1.0
+        coeffs = np.polyfit(t_norm, track_freq[mask], min(poly_order, np.sum(mask) - 1))
+        # Evaluate at all points
+        t_all_norm = 2.0 * (t_idx - t_idx[mask][0]) / max(1, t_idx[mask][-1] - t_idx[mask][0]) - 1.0
+        poly_fit = np.polyval(coeffs, t_all_norm)
+        residuals = np.abs(track_freq - poly_fit)
+        sigma = np.std(track_freq[mask] - poly_fit[mask])
+        if sigma < 1e-6:
+            break
+        new_mask = residuals < sigma_clip * sigma
+        if np.array_equal(new_mask, mask):
+            break
+        mask = new_mask
+
+    n_rejected = nf - np.sum(mask)
+    if n_rejected > 0:
+        # Replace outliers with polynomial prediction before Kalman
+        track_freq = track_freq.copy()
+        track_freq[~mask] = poly_fit[~mask]
+        # Mark outliers with very low SNR so Kalman trusts them less
+        track_snr = track_snr.copy()
+        track_snr[~mask] = -10.0
+
+    # --- Stage 2: Kalman RTS smoother, state = [freq, freq_rate] ---
+    # Measurement noise per point: inversely proportional to SNR
+    snr_linear = np.maximum(10.0 ** (track_snr / 10.0), 0.1)
+    # Base noise variance from median SNR
+    median_snr_lin = np.median(snr_linear[mask]) if np.any(mask) else 1.0
+    base_var = np.var(track_freq[mask] - poly_fit[mask]) if np.any(mask) else 1e6
+    base_var = max(base_var, 1.0)  # floor
+    R_per = base_var * (median_snr_lin / snr_linear)  # lower SNR → higher variance
+
+    # State vectors and covariance
+    x = np.zeros((nf, 2))       # [freq, freq_rate]
+    P = np.zeros((nf, 2, 2))
+    x_pred = np.zeros((nf, 2))
+    P_pred = np.zeros((nf, 2, 2))
+    H = np.array([[1.0, 0.0]])
+
+    # Initialize
+    x[0] = [track_freq[0], 0.0]
+    P[0] = np.diag([base_var, base_var])
+
+    # Forward pass
+    for i in range(1, nf):
+        dt = 1.0  # uniform frame steps
+        F = np.array([[1.0, dt], [0.0, 1.0]])
+        Q = q_accel * np.array([[dt**3 / 3, dt**2 / 2],
+                                [dt**2 / 2, dt]])
+        # Predict
+        x_pred[i] = F @ x[i - 1]
+        P_pred[i] = F @ P[i - 1] @ F.T + Q
+        # Update
+        R_i = np.array([[R_per[i]]])
+        y = track_freq[i] - H @ x_pred[i]
+        S = H @ P_pred[i] @ H.T + R_i
+        K = P_pred[i] @ H.T / S[0, 0]
+        x[i] = x_pred[i] + (K * y[0]).flatten()
+        P[i] = (np.eye(2) - K @ H) @ P_pred[i]
+
+    # RTS backward smoother
+    x_smooth = x.copy()
+    P_smooth = P.copy()
+    for i in range(nf - 2, -1, -1):
+        dt = 1.0
+        F = np.array([[1.0, dt], [0.0, 1.0]])
+        P_pred_i1 = P_pred[i + 1]
+        # Avoid singular inversion
+        det = P_pred_i1[0, 0] * P_pred_i1[1, 1] - P_pred_i1[0, 1] * P_pred_i1[1, 0]
+        if abs(det) < 1e-30:
+            continue
+        P_pred_inv = np.array([[P_pred_i1[1, 1], -P_pred_i1[0, 1]],
+                               [-P_pred_i1[1, 0], P_pred_i1[0, 0]]]) / det
+        C = P[i] @ F.T @ P_pred_inv
+        x_smooth[i] = x[i] + C @ (x_smooth[i + 1] - x_pred[i + 1])
+        P_smooth[i] = P[i] + C @ (P_smooth[i + 1] - P_pred[i + 1]) @ C.T
+
+    return x_smooth[:, 0]
+
+
+def _viterbi_ridge(psd_db, freq_axis, max_drift_hz_per_step, stack_k=1):
+    """Find optimal frequency track through spectrogram using Viterbi.
+
+    Args:
+        psd_db        : 2D array (n_frames, n_bins) — power in dB
+        freq_axis     : 1D array of frequencies [Hz]
+        max_drift_hz_per_step : max allowed frequency change per time step [Hz]
+        stack_k       : stack K consecutive frames before tracking (SNR boost)
+
+    Returns:
+        track_freq : 1D array (n_output_frames,) — frequency at each step [Hz]
+        track_snr  : 1D array — estimated SNR at each step [dB]
+    """
+    n_frames, n_bins = psd_db.shape
+
+    # Optional stacking for initial SNR boost
+    if stack_k > 1:
+        n_stacked = n_frames // stack_k
+        stacked = np.zeros((n_stacked, n_bins), dtype=np.float64)
+        for i in range(n_stacked):
+            # Average in linear domain, then back to dB
+            lin = 10.0 ** (psd_db[i*stack_k:(i+1)*stack_k, :] / 10.0)
+            stacked[i, :] = 10.0 * np.log10(np.mean(lin, axis=0) + 1e-30)
+        psd_work = stacked
+    else:
+        psd_work = psd_db
+        n_stacked = n_frames
+
+    nf, nb = psd_work.shape
+
+    # Noise floor per frame (median across bins)
+    noise_floor = np.median(psd_work, axis=1, keepdims=True)
+    # Normalized: subtract noise floor so signal shows as positive
+    psd_norm = psd_work - noise_floor
+
+    # Max drift in bins per step
+    bin_hz = freq_axis[1] - freq_axis[0] if len(freq_axis) > 1 else 1.0
+    max_drift_bins = max(1, int(max_drift_hz_per_step / abs(bin_hz) + 0.5))
+
+    # Viterbi forward pass
+    # cost[j] = best accumulated score arriving at bin j
+    cost = psd_norm[0, :].copy()
+    backptr = np.zeros((nf, nb), dtype=np.int32)
+
+    for t in range(1, nf):
+        new_cost = np.full(nb, -1e30)
+        for j in range(nb):
+            # Candidate predecessors: bins within max_drift_bins of j
+            lo = max(0, j - max_drift_bins)
+            hi = min(nb, j + max_drift_bins + 1)
+            best_prev = lo + int(np.argmax(cost[lo:hi]))
+            new_cost[j] = cost[best_prev] + psd_norm[t, j]
+            backptr[t, j] = best_prev
+        cost = new_cost
+
+    # Backtrack
+    track_bins = np.zeros(nf, dtype=np.int32)
+    track_bins[nf - 1] = int(np.argmax(cost))
+    for t in range(nf - 2, -1, -1):
+        track_bins[t] = backptr[t + 1, track_bins[t + 1]]
+
+    # Extract frequencies and SNR along track, with sub-bin interpolation
+    bin_hz = freq_axis[1] - freq_axis[0] if len(freq_axis) > 1 else 1.0
+    track_freq = np.zeros(nf)
+    track_snr = np.zeros(nf)
+    for t in range(nf):
+        k = track_bins[t]
+        track_snr[t] = psd_norm[t, k]
+        # Parabolic interpolation for sub-bin accuracy
+        if 0 < k < nb - 1:
+            y1 = psd_work[t, k - 1]
+            y2 = psd_work[t, k]
+            y3 = psd_work[t, k + 1]
+            denom = 2 * y2 - y1 - y3
+            if denom > 0:
+                delta = 0.5 * (y1 - y3) / denom
+                track_freq[t] = freq_axis[k] + delta * bin_hz
+            else:
+                track_freq[t] = freq_axis[k]
+        else:
+            track_freq[t] = freq_axis[k]
+
+    # Smooth the track — Doppler is physically smooth, remove noise jitter
+    # Stage 1: Iterative sigma-clipping with polynomial fit (outlier rejection)
+    # Stage 2: Kalman RTS smoother (optimal batch smoothing)
+    if nf >= 10:
+        # Adaptive q_accel: estimate drift rate from raw track, scale accordingly
+        # L1 objects (~0.01 Hz/s): q_accel ~0.1; lunar orbit (~16 Hz/s): q_accel ~50
+        diffs = np.diff(track_freq)
+        med_rate = np.median(np.abs(diffs))
+        # Also estimate acceleration (change in rate)
+        if len(diffs) > 1:
+            accels = np.abs(np.diff(diffs))
+            med_accel = np.median(accels)
+        else:
+            med_accel = med_rate
+        # q_accel = max(0.1, observed_accel^2) — trust data dynamics
+        q_accel = max(0.1, float(med_accel ** 2))
+        # Cap at reasonable value
+        q_accel = min(q_accel, 1e4)
+        track_freq = _smooth_kalman_rts(track_freq, track_snr, poly_order=3,
+                                        sigma_clip=2.5, q_accel=q_accel)
+    elif nf >= 5:
+        hw = max(1, nf // 4)
+        smoothed = track_freq.copy()
+        for i in range(nf):
+            lo = max(0, i - hw)
+            hi = min(nf, i + hw + 1)
+            smoothed[i] = np.median(track_freq[lo:hi])
+        track_freq = smoothed
+
+    # Expand back to original frame count if stacked
+    if stack_k > 1:
+        track_freq_full = np.repeat(track_freq, stack_k)[:n_frames]
+        track_snr_full = np.repeat(track_snr, stack_k)[:n_frames]
+        return track_freq_full, track_snr_full
+
+    return track_freq, track_snr
+
+
 def estimate_carrier(
     iq_block,
     sample_rate,
@@ -538,6 +825,8 @@ def estimate_carrier(
     hint_bw     = 50_000,
     excl_sidebands = True,
     oqpsk       = False,
+    centroid    = False,
+    dc_excl     = 0.0,
 ):
     """
     Find residual PCM/PM/NRZ carrier using Welch method.
@@ -546,6 +835,12 @@ def estimate_carrier(
       For OQPSK (suppressed carrier) raise IQ to 4th power.
       QPSK modulation cancels (phases 0/90/180/270 deg * 4 = 0 deg),
       leaving a pure CW line at 4*delta_f. Result divided by 4.
+
+    --centroid mode (modulated signal tracking):
+      Instead of finding a single peak bin, computes the power-weighted
+      spectral centroid within the search window. Works for BPSK/QPSK
+      telemetry signals where the carrier is spread across a bandwidth.
+      Requires --carrier-hint to define the search region.
 
     Search mask logic:
       1. search_bw  -> restrict to central search_bw Hz
@@ -560,6 +855,10 @@ def estimate_carrier(
         iq_proc = (iq_block.astype(np.complex128) ** 4).astype(np.complex64)
     else:
         iq_proc = iq_block
+
+    # DC removal: subtract mean to eliminate SDR DC spike before PSD.
+    # Always applied — DC component carries no Doppler information.
+    iq_proc = iq_proc - np.mean(iq_proc)
 
     psd   = welch_psd(iq_proc, fft_size, n_sub)
     freqs = np.fft.fftfreq(fft_size, d=1.0/sample_rate)   # offset [Hz] from center
@@ -578,16 +877,59 @@ def estimate_carrier(
     # -- Exclude sideband regions -------------------------------------------
     # PCM/PM/NRZ: sidebands at +/-dr, +/-3dr, +/-5dr from carrier
     # Only exclude +/-dr (first, strongest)
-    if excl_sidebands:
+    if excl_sidebands and not centroid:
         for dr in ORION_DATA_RATES_HZ:
             guard = SIDEBAND_GUARD_HZ + dr * 0.05
             for sign in (+1, -1):
                 mask[np.abs(freqs - sign * dr) < guard] = False
 
+    # -- DC exclusion zone (avoid DC spur from SDR) --------------------------
+    if dc_excl > 0:
+        mask &= np.abs(freqs) > dc_excl
+
     if not np.any(mask):
         # Fallback: drop sideband mask (may not apply to this band)
         mask = np.abs(freqs) <= sample_rate * 0.40
+        if dc_excl > 0:
+            mask &= np.abs(freqs) > dc_excl
 
+    # -- Centroid mode ------------------------------------------------------
+    if centroid:
+        psd_m = psd[mask]
+        freqs_m = freqs[mask]
+
+        # Noise floor: measured OUTSIDE the hint window (robust estimate)
+        if carrier_hint is not None:
+            noise_region = np.abs(freqs) <= sample_rate * 0.40
+            noise_region &= ~mask   # exclude signal window
+            if np.sum(noise_region) > 100:
+                noise_p = float(np.median(psd[noise_region]))
+            else:
+                noise_p = float(np.median(np.sort(psd_m)[:max(1, len(psd_m)//5)]))
+        else:
+            noise_p = float(np.median(np.sort(psd_m)[:max(1, len(psd_m)//5)]))
+
+        # Subtract noise baseline from signal window
+        sig_psd = np.maximum(psd_m - noise_p, 0.0)
+        total_sig = float(np.sum(sig_psd))
+
+        if total_sig <= 0:
+            return center_freq + (carrier_hint or 0.0), 0.0
+
+        # Power-weighted centroid
+        raw_offset = float(np.sum(freqs_m * sig_psd) / total_sig)
+
+        # SNR: mean power in signal window vs noise
+        sig_mean = float(np.mean(psd_m))
+        if noise_p > 0 and sig_mean > noise_p:
+            snr_db = 10.0 * math.log10(sig_mean / noise_p)
+        else:
+            snr_db = 0.0
+
+        freq_abs = center_freq + raw_offset
+        return freq_abs, snr_db
+
+    # -- Peak mode (CW carrier) --------------------------------------------
     psd_m = np.where(mask, psd, 0.0)
     peak  = int(np.argmax(psd_m))
 
@@ -759,6 +1101,10 @@ def process_iq(
     interactive     = True,
     oqpsk           = False,
     auto            = False,
+    centroid        = False,
+    weak            = False,
+    max_drift       = 10.0,
+    weak_stack      = 1,
 ):
     """
     Slide integration window and collect carrier frequency measurements.
@@ -793,15 +1139,465 @@ def process_iq(
     if carrier_hint is not None:
         print(f"  Carrier hint     : {carrier_hint:+.0f} Hz from center")
     print(f"  Excl. sidebands  : {'yes' if excl_sidebands else 'no'}")
-    if auto:
+    if weak and oqpsk:
+        print(f"  Mode             : OQPSK+WEAK (IQ^4 + Viterbi ridge tracker)")
+        print(f"  Max drift        : {max_drift:.1f} Hz/s ({max_drift*integration_sec:.1f} Hz/step)")
+        if weak_stack > 1:
+            print(f"  Frame stacking   : {weak_stack}x (SNR boost ~{5*math.log10(weak_stack):.1f} dB)")
+    elif weak:
+        print(f"  Mode             : WEAK (Viterbi ridge tracker)")
+        print(f"  Max drift        : {max_drift:.1f} Hz/s ({max_drift*integration_sec:.1f} Hz/step)")
+        if weak_stack > 1:
+            print(f"  Frame stacking   : {weak_stack}x (SNR boost ~{5*math.log10(weak_stack):.1f} dB)")
+    elif auto:
         print(f"  Mode             : AUTO (carrier -> OQPSK fallback)")
+    elif centroid:
+        print(f"  Mode             : centroid (power-weighted spectral center)")
     elif oqpsk:
         print(f"  Mode             : OQPSK (IQ^4, /4)")
     else:
         print(f"  Mode             : carrier (Welch)")
-    print(f"  Adaptive         : yes (auto-increase welch-sub if acceptance < 70%)")
+    if not weak:
+        print(f"  Adaptive         : yes (auto-increase welch-sub if acceptance < 70%)")
     print(f"  Blocks           : {n_blocks}")
     print(f"{'='*64}")
+
+    # ------------------------------------------------------------------
+    # AUTO-DETECT mode: probe CW → OQPSK → weak Viterbi (if no manual mode set)
+    # ------------------------------------------------------------------
+    auto_detected_mode = None
+    original_carrier_hint = carrier_hint   # save before auto-detect modifies it
+    probe_dc_excl = 0.0   # measured DC spike exclusion (set by auto-detect probe)
+    narrow_dc_notch = False  # True when carrier near DC — notch only 1 bin
+    # ------------------------------------------------------------------
+    # Measure DC spike from first block (always, regardless of mode)
+    # ------------------------------------------------------------------
+    blk0 = iq[0:spb]
+    psd0 = welch_psd(blk0, eff_fft, n_welch_sub)
+    freqs0 = np.fft.fftfreq(eff_fft, d=1.0 / sample_rate)
+    dc_bin = np.argmin(np.abs(freqs0))
+    dc_power = 10.0 * np.log10(psd0[dc_bin] + 1e-30)
+    noise_floor = 10.0 * np.log10(np.median(psd0) + 1e-30)
+    dc_snr = dc_power - noise_floor
+    bin_hz = sample_rate / eff_fft
+    if dc_snr > 10.0:
+        probe_dc_excl = 3.0 * bin_hz
+        print(f"\n  [DC spike] {dc_snr:.0f} dB above noise, "
+              f"excluding ±{probe_dc_excl:.0f} Hz")
+    elif dc_snr > 6.0:
+        probe_dc_excl = 2.0 * bin_hz
+        print(f"\n  [DC spike] Mild: {dc_snr:.0f} dB, "
+              f"excluding ±{probe_dc_excl:.0f} Hz")
+    else:
+        print(f"\n  [DC spike] None detected ({dc_snr:.1f} dB)")
+
+    if not weak and not oqpsk and not centroid and carrier_hint is None:
+        # ---------------------------------------------------------------
+        # Parallel probe: test first 10 blocks with BOTH CW and OQPSK
+        # ---------------------------------------------------------------
+        n_probe = min(10, n_blocks)
+        probe_ok = 0       # CW detections
+        probe_offsets = []  # CW offsets [Hz]
+        probe_snrs = []     # CW SNRs [dB]
+        probe_ok_q = 0       # OQPSK detections
+        probe_offsets_q = [] # OQPSK offsets [Hz]
+        probe_snrs_q = []    # OQPSK SNRs [dB]
+        for pi in range(n_probe):
+            blk = iq[pi * spb : (pi + 1) * spb]
+            # CW attempt
+            try:
+                f_det, s = estimate_carrier(
+                    blk, sample_rate, center_freq,
+                    fft_size=eff_fft, n_sub=n_welch_sub,
+                    search_bw=search_bw, carrier_hint=carrier_hint,
+                    hint_bw=hint_bw, excl_sidebands=excl_sidebands,
+                    oqpsk=False, dc_excl=probe_dc_excl)
+                if s >= min_snr_db:
+                    probe_ok += 1
+                    probe_offsets.append(f_det - center_freq)
+                    probe_snrs.append(s)
+            except Exception:
+                pass
+            # OQPSK attempt (IQ^4 carrier recovery)
+            try:
+                f_det_q, s_q = estimate_carrier(
+                    blk, sample_rate, center_freq,
+                    fft_size=eff_fft, n_sub=n_welch_sub,
+                    search_bw=search_bw, carrier_hint=carrier_hint,
+                    hint_bw=hint_bw, excl_sidebands=False,
+                    oqpsk=True, dc_excl=probe_dc_excl)
+                if s_q >= min_snr_db + 2.0:
+                    probe_ok_q += 1
+                    probe_offsets_q.append(f_det_q - center_freq)
+                    probe_snrs_q.append(s_q)
+            except Exception:
+                pass
+
+        # --- CW quality metrics ---
+        if len(probe_offsets) >= 3:
+            med = float(np.median(probe_offsets))
+            offset_scatter = float(np.median(np.abs(np.array(probe_offsets) - med)))
+        elif probe_offsets:
+            med = float(np.median(probe_offsets))
+            offset_scatter = 0.0
+        else:
+            med = 0.0
+            offset_scatter = 1e9
+        cw_stable = offset_scatter < 2000.0
+        cw_rate = probe_ok / n_probe
+
+        # --- OQPSK quality metrics ---
+        if len(probe_offsets_q) >= 3:
+            med_q = float(np.median(probe_offsets_q))
+            scatter_q = float(np.median(np.abs(np.array(probe_offsets_q) - med_q)))
+        elif probe_offsets_q:
+            med_q = float(np.median(probe_offsets_q))
+            scatter_q = 0.0
+        else:
+            med_q = 0.0
+            scatter_q = 1e9
+        oqpsk_stable = scatter_q < 2000.0
+        oqpsk_rate = probe_ok_q / n_probe
+
+        # --- Bi-modal DC spike detection ---
+        bimodal = False
+        sign_changes = 0
+        if len(probe_offsets) >= 4:
+            offs_arr = np.array(probe_offsets)
+            signs = np.sign(offs_arr)
+            sign_changes = int(np.sum(signs[1:] != signs[:-1]))
+            if sign_changes >= len(offs_arr) * 0.4 and abs(med) < 500:
+                bimodal = True
+
+        # --- Compare CW vs OQPSK quality ---
+        # Score = acceptance_rate × consistency (lower scatter = better)
+        cw_score = cw_rate * max(0.0, 1.0 - offset_scatter / 5000.0) if cw_rate > 0 else 0
+        oqpsk_score = oqpsk_rate * max(0.0, 1.0 - scatter_q / 5000.0) if oqpsk_rate > 0 else 0
+        # OQPSK needs to be clearly better to override CW (avoid false positives
+        # from frequency comb — comb under IQ^4 gives inconsistent peaks)
+        oqpsk_wins = (oqpsk_score > cw_score * 1.2
+                      and oqpsk_rate >= 0.3
+                      and oqpsk_stable)
+
+        print(f"\n  [auto-detect] Probe results: "
+              f"CW {probe_ok}/{n_probe} (scatter {offset_scatter:.0f} Hz), "
+              f"OQPSK {probe_ok_q}/{n_probe} (scatter {scatter_q:.0f} Hz)")
+
+        # Helper: coarse scan excluding DC to find real signal
+        def _coarse_dc_scan():
+            """Returns (carrier_hint, hint_bw, accum_db, range) or None."""
+            _cfft = min(4096, eff_fft)
+            _cn = min(200, n_blocks)
+            _max_sub = spb // (_cfft // 2) - 1  # 50% overlap
+            _cns = min(max(n_welch_sub, 20), _max_sub)
+            _dc_ex = max(probe_dc_excl * 15, 500.0)
+            _freqs = np.fft.fftfreq(_cfft, d=1.0 / sample_rate)
+            _bw_mask = np.abs(_freqs) <= search_bw / 2
+            _dc_mask = np.abs(_freqs) <= _dc_ex
+            _idx = np.where(_bw_mask)[0]
+            _order = np.argsort(_freqs[_idx])
+            _idx = _idx[_order]
+            _fax = _freqs[_idx]
+            _dc_suppress = np.where(_dc_mask)[0]
+            _psd = np.zeros((_cn, len(_idx)), dtype=np.float64)
+            for _ci in range(_cn):
+                _blk = iq[_ci * spb : (_ci + 1) * spb]
+                _p = welch_psd(_blk, _cfft, _cns)
+                _nf = np.median(_p)
+                _p[_dc_suppress] = _nf
+                _psd[_ci, :] = _p[_idx]
+            _psd = 10.0 * np.log10(_psd + 1e-30)
+            _med_spec = np.median(_psd, axis=0)
+            _psd = _psd - _med_spec
+            _drift = max_drift * integration_sec
+            _track, _snr = _viterbi_ridge(_psd, _fax, _drift)
+            _acc = np.sum(np.maximum(10.0 ** (_snr / 10.0), 0.0))
+            _acc_db = 10.0 * math.log10(max(1.0, _acc))
+            _med = float(np.median(_track))
+            if _acc_db >= 3.0 and abs(_med) > _dc_ex:
+                _rng = float(np.max(_track) - np.min(_track))
+                return _med, max(hint_bw, _rng * 2 + 2000), _acc_db, _rng
+            return None
+
+        # --- Decision tree ---
+        if oqpsk_wins:
+            # OQPSK is clearly better than CW — use auto CW/OQPSK mode
+            auto_detected_mode = "OQPSK"
+            auto = True
+            print(f"  [auto-detect] OQPSK signal detected "
+                  f"(score {oqpsk_score:.2f} vs CW {cw_score:.2f}), "
+                  f"using auto CW/OQPSK mode.")
+        elif cw_rate >= 0.7 and cw_stable and not bimodal:
+            if abs(med) < 500 and probe_dc_excl > 0:
+                if dc_snr > 10.0:
+                    print(f"  [auto-detect] CW probe near DC "
+                          f"(median {med:+.0f} Hz) "
+                          f"+ strong DC spike ({dc_snr:.0f} dB)")
+                    print(f"  [auto-detect] Scanning for signal away from DC...")
+                    cs = _coarse_dc_scan()
+                    if cs is not None:
+                        auto_detected_mode = "WEAK"
+                        weak = True
+                        carrier_hint = cs[0]
+                        hint_bw = cs[1]
+                        print(f"  [auto-detect] Found signal at "
+                              f"{carrier_hint:+.0f} Hz (accum SNR "
+                              f"{cs[2]:.1f} dB, range {cs[3]:.0f} Hz)")
+                        print(f"  [auto-detect] Search window: "
+                              f"{carrier_hint:+.0f} ± {hint_bw:.0f} Hz")
+                    else:
+                        bin_hz = sample_rate / eff_fft
+                        probe_dc_excl = bin_hz
+                        auto_detected_mode = "CW"
+                        print(f"  [auto-detect] No signal away from DC — "
+                              f"CW carrier near DC, narrowing exclusion "
+                              f"to ±{bin_hz:.0f} Hz.")
+                else:
+                    bin_hz = sample_rate / eff_fft
+                    probe_dc_excl = bin_hz
+                    auto_detected_mode = "CW"
+                    print(f"  [auto-detect] CW carrier near DC "
+                          f"(median {med:+.0f} Hz)")
+                    print(f"  [auto-detect] Narrowing DC exclusion to "
+                          f"±{bin_hz:.0f} Hz (1 bin) to preserve carrier.")
+            else:
+                auto_detected_mode = "CW"
+                print(f"  [auto-detect] CW carrier detected "
+                      f"(scatter {offset_scatter:.0f} Hz), "
+                      f"using standard mode.")
+        elif bimodal and cw_rate >= 0.3:
+            median_off = float(np.median(probe_offsets)) if probe_offsets else 0.0
+            auto_detected_mode = "WEAK"
+            weak = True
+            print(f"  [auto-detect] DC spike interference detected "
+                  f"({sign_changes} sign flips, "
+                  f"median {median_off:+.0f} Hz)")
+            print(f"  [auto-detect] Scanning for signal away from DC...")
+            cs = _coarse_dc_scan()
+            if cs is not None:
+                carrier_hint = cs[0]
+                hint_bw = cs[1]
+                print(f"  [auto-detect] Found signal at {carrier_hint:+.0f} Hz "
+                      f"(accum SNR {cs[2]:.1f} dB, range {cs[3]:.0f} Hz)")
+                print(f"  [auto-detect] Search window: "
+                      f"{carrier_hint:+.0f} ± {hint_bw:.0f} Hz")
+            elif abs(median_off) < 500:
+                carrier_hint = median_off
+                hint_bw = max(hint_bw, 50000)
+                narrow_dc_notch = True
+                print(f"  [auto-detect] Signal near DC — "
+                      f"using Viterbi with narrow DC notch.")
+            else:
+                carrier_hint = median_off
+                hint_bw = max(hint_bw, 50000)
+                print(f"  [auto-detect] Using Viterbi to track "
+                      f"through DC region...")
+        elif oqpsk_rate >= 0.3 and oqpsk_stable:
+            # OQPSK is viable even if CW also had marginal detections
+            auto_detected_mode = "OQPSK"
+            auto = True
+            print(f"  [auto-detect] OQPSK signal detected "
+                  f"({probe_ok_q}/{n_probe} blocks), "
+                  f"using auto CW/OQPSK mode.")
+        elif cw_rate >= 0.3:
+            median_off = float(np.median(probe_offsets)) if probe_offsets else 0.0
+            auto_detected_mode = "WEAK"
+            weak = True
+            carrier_hint = median_off
+            hint_bw = max(hint_bw, 50000)
+            stable_msg = "stable" if cw_stable else "scattered"
+            print(f"  [auto-detect] Marginal CW signal "
+                  f"({probe_ok}/{n_probe} blocks, {stable_msg}, "
+                  f"median {median_off:+.0f} Hz)")
+            print(f"  [auto-detect] Using Viterbi + CW refinement...")
+        else:
+            # Both failed → switch to weak mode with auto carrier search
+            auto_detected_mode = "WEAK"
+            weak = True
+            print(f"  [auto-detect] No strong signal "
+                  f"(CW: {probe_ok}/{n_probe}, OQPSK: {probe_ok_q}/{n_probe})")
+            print(f"  [auto-detect] Switching to weak signal mode "
+                  f"(Viterbi ridge tracker)...")
+
+            if carrier_hint is None:
+                print(f"  [auto-detect] Scanning for signal...")
+                cs = _coarse_dc_scan()
+                if cs is not None:
+                    carrier_hint = cs[0]
+                    hint_bw = cs[1]
+                    print(f"  [auto-detect] Found signal at "
+                          f"{carrier_hint:+.0f} Hz (accum SNR "
+                          f"{cs[2]:.1f} dB)")
+                    print(f"  [auto-detect] Search window: "
+                          f"{carrier_hint:+.0f} ± {hint_bw:.0f} Hz")
+                else:
+                    print(f"  [auto-detect] No signal found in "
+                          f"coarse scan, using full band...")
+
+    # ------------------------------------------------------------------
+    # WEAK mode: spectrogram + Viterbi ridge tracker
+    # ------------------------------------------------------------------
+    if weak:
+        # Exclude DC region in Viterbi — DC spike from SDR can hijack tracking
+        # DC handling for Viterbi: use spectral subtraction when DC spike
+        # is strong (>10 dB) — it removes the stationary pedestal while
+        # preserving the drifting carrier. When DC spike is mild or absent,
+        # use a fixed exclusion zone instead.
+        use_spectral_sub = dc_snr > 10.0
+        if use_spectral_sub:
+            weak_dc_excl = 0.0  # spectral subtraction handles DC
+        else:
+            weak_dc_excl = max(probe_dc_excl * 15, 500.0)
+
+        # OQPSK+WEAK: scale carrier hint and search window by 4×
+        # IQ^4 moves carrier from f to 4*f, so search at 4× offset
+        vit_carrier_hint = carrier_hint
+        vit_hint_bw = hint_bw
+        vit_search_bw = search_bw
+        vit_max_drift = max_drift
+        if oqpsk:
+            if vit_carrier_hint is not None:
+                vit_carrier_hint = vit_carrier_hint * 4.0
+                vit_hint_bw = vit_hint_bw * 4.0
+            if vit_search_bw is not None:
+                vit_search_bw = min(vit_search_bw * 4.0, sample_rate * 0.80)
+            vit_max_drift = vit_max_drift * 4.0
+            weak_dc_excl = max(weak_dc_excl, 500.0)  # IQ^4 creates DC from modulation
+            print(f"\n  [OQPSK+WEAK] IQ^4 carrier recovery + Viterbi tracking")
+            print(f"  [OQPSK+WEAK] Frequencies in IQ^4 domain (÷4 after tracking)")
+
+        print(f"\n  Building spectrogram ({n_blocks} frames)...", flush=True)
+        psd_matrix, freq_axis, _ = _build_spectrogram(
+            iq, sample_rate, eff_fft, n_welch_sub, spb, n_blocks,
+            vit_carrier_hint, vit_hint_bw, vit_search_bw,
+            dc_excl=weak_dc_excl, oqpsk=oqpsk)
+
+        if use_spectral_sub:
+            # Spectral subtraction: remove stationary features (DC spike,
+            # LO phase noise pedestal). Drifting carrier survives because
+            # it appears at different bins in each frame.
+            median_spectrum = np.median(psd_matrix, axis=0)
+            psd_matrix = psd_matrix - median_spectrum
+
+        max_drift_per_step = vit_max_drift * integration_sec
+        print(f"  Running Viterbi ridge tracker "
+              f"(max drift {max_drift_per_step:.1f} Hz/step, "
+              f"{len(freq_axis)} freq bins)...", flush=True)
+
+        track_freq, track_snr = _viterbi_ridge(
+            psd_matrix, freq_axis, max_drift_per_step, stack_k=weak_stack)
+
+        # OQPSK+WEAK: divide tracked frequencies by 4 to get actual carrier
+        if oqpsk:
+            track_freq = track_freq / 4.0
+            print(f"  [OQPSK+WEAK] Divided {len(track_freq)} tracked "
+                  f"frequencies by 4")
+
+        # -- CW refinement: use Viterbi track as per-block carrier hint ------
+        # Viterbi gives robust detection (100% coverage), CW Welch gives better
+        # frequency precision (sub-Hz vs ~10 Hz). Hybrid: try CW at each Viterbi
+        # position, fall back to Viterbi result if CW fails.
+        # In OQPSK+WEAK mode, CW refinement also uses IQ^4 (oqpsk=True).
+        accum_snr_linear = np.sum(np.maximum(10.0 ** (track_snr / 10.0), 0.0))
+        accum_snr_db = 10.0 * math.log10(max(1.0, accum_snr_linear))
+        weak_accept_all = accum_snr_db >= 6.0
+
+        # CW refinement bandwidth: ±500 Hz around Viterbi position
+        # (in actual freq domain, not IQ^4 domain — estimate_carrier handles
+        #  the ×4 internally when oqpsk=True)
+        refine_bw = 500.0
+        n_refined = 0
+        measurements = []
+        skipped = 0
+        for i in range(min(len(track_freq), n_blocks)):
+            t = start_time + timedelta(seconds=(i + 1) * integration_sec)
+            viterbi_freq = center_freq + track_freq[i]
+            viterbi_snr = float(track_snr[i])
+            viterbi_offset = track_freq[i]
+
+            # Try CW Welch refinement at Viterbi position
+            freq_abs = viterbi_freq
+            snr = viterbi_snr
+            refined = False
+            if weak_accept_all or viterbi_snr >= min_snr_db:
+                try:
+                    block = iq[i * spb : (i + 1) * spb]
+                    cw_freq, cw_snr = estimate_carrier(
+                        block, sample_rate, center_freq,
+                        fft_size=eff_fft, n_sub=n_welch_sub,
+                        carrier_hint=viterbi_offset, hint_bw=refine_bw,
+                        excl_sidebands=False, dc_excl=probe_dc_excl,
+                        oqpsk=oqpsk,
+                    )
+                    if cw_snr >= min_snr_db:
+                        freq_abs = cw_freq
+                        snr = cw_snr
+                        refined = True
+                        n_refined += 1
+                except Exception:
+                    pass
+
+            offset = freq_abs - center_freq
+            if weak_accept_all or snr >= min_snr_db:
+                measurements.append((t, freq_abs, snr))
+                tag = "OK"
+            else:
+                skipped += 1
+                tag = "--"
+
+            if i < 5 or (i + 1) % max(1, n_blocks // 20) == 0 or i == n_blocks - 1:
+                r_tag = "R" if refined else " "
+                print(f"  [{tag:>2s}]{r_tag}{i+1:5d}/{n_blocks}  "
+                      f"{t.strftime('%Y-%jT%H:%M:%S.') + f'{t.microsecond//1000:03d}':26s}"
+                      f"  offset={offset:+10.2f} Hz  SNR={snr:5.1f} dB")
+
+        n_ok = len(measurements)
+        print(f"\n  Accepted: {n_ok}/{n_blocks}  (skipped: {skipped})")
+        if n_refined:
+            print(f"  CW refined     : {n_refined}/{n_ok} "
+                  f"({n_refined*100//max(1,n_ok)}%)")
+        if measurements:
+            offsets = [m[1] - center_freq for m in measurements]
+            snrs = [m[2] for m in measurements]
+            print(f"  Carrier offset : min={min(offsets):+.1f}  "
+                  f"max={max(offsets):+.1f}  "
+                  f"drift={max(offsets)-min(offsets):.1f} Hz")
+            print(f"  SNR            : min={min(snrs):.1f}  "
+                  f"max={max(snrs):.1f}  mean={sum(snrs)/len(snrs):.1f} dB")
+            accum_snr = 10.0 * math.log10(max(1, sum(10**(s/10) for s in snrs)))
+            print(f"  Accumulated SNR : {accum_snr:.1f} dB "
+                  f"(track total across {n_ok} frames)")
+
+        # Detect mode transitions: sustained drift rate reversal over 60-pt window
+        # Uses longer window for robustness against Viterbi tracker oscillation
+        weak_transitions = []
+        if len(measurements) >= 200:
+            offsets_arr = [m[1] - center_freq for m in measurements]
+            win = 60
+            for mi in range(win, len(offsets_arr) - win):
+                # Drift rate before and after this point
+                rate_before = (offsets_arr[mi] - offsets_arr[mi - win]) / (win * integration_sec)
+                rate_after = (offsets_arr[mi + win] - offsets_arr[mi]) / (win * integration_sec)
+                # Sign reversal with significant magnitude on both sides
+                if (rate_before * rate_after < 0
+                        and abs(rate_before) > 3.0 and abs(rate_after) > 3.0
+                        and abs(rate_before - rate_after) > 8.0):
+                    # Debounce: skip if too close to previous transition (5 min)
+                    if (not weak_transitions
+                            or (measurements[mi][0] - weak_transitions[-1][0]).total_seconds() > 300):
+                        weak_transitions.append((
+                            measurements[mi][0],
+                            measurements[mi][1],
+                            measurements[mi][1],
+                        ))
+        if weak_transitions:
+            print(f"  Mode transitions: {len(weak_transitions)}")
+            for mt_t, mt_from, mt_to in weak_transitions:
+                print(f"    {mt_t.strftime('%Y-%jT%H:%M:%S')}: "
+                      f"{mt_from/1e6:.6f} MHz "
+                      f"(drift rate reversal)")
+
+        return measurements, weak_transitions
 
     measurements = []
     skipped = 0
@@ -809,6 +1605,18 @@ def process_iq(
     probe_raw = []       # (t, freq_abs, snr) -- all blocks in probe phase
     n_carrier_mode = 0   # blocks detected via direct carrier (auto mode)
     n_oqpsk_mode   = 0   # blocks detected via OQPSK IQ^4 (auto mode)
+    mode_transitions = []  # list of (datetime, from_freq, to_freq) for TDM COMMENT
+
+    # DC exclusion: apply in CW mode when no explicit carrier hint was given
+    # (user-supplied carrier_hint means DC is far from the signal)
+    user_carrier_hint = original_carrier_hint  # original CLI value (before auto-detect)
+    # Use DC exclusion measured during auto-detect probe, or 0 if no spike found
+    dc_excl = probe_dc_excl if (not oqpsk and not centroid) else 0.0
+
+    # Carrier tracking: after probe phase, track carrier to prevent DC spur jumps
+    tracking_offset = None   # last accepted carrier offset from center [Hz]
+    tracking_bw = None       # adaptive tracking bandwidth [Hz]
+    TRACKING_MAX_JUMP = 500  # max Hz jump per block before flagging transition
 
     use_tty = interactive and sys.stdout.isatty() and sys.stdin.isatty()
     probe_n = min(20, max(10, n_blocks // 10))
@@ -822,15 +1630,22 @@ def process_iq(
         # Timestamp = end of integration window
         t = start_time + timedelta(seconds=(i + 1) * integration_sec)
 
+        # Carrier tracking: after probe phase, use tracking hint to follow signal
+        eff_hint = carrier_hint
+        eff_hint_bw = hint_bw
+        if probe_done and tracking_offset is not None and user_carrier_hint is None:
+            eff_hint = tracking_offset
+            eff_hint_bw = tracking_bw
+
         try:
             if auto:
                 # Attempt 1: direct carrier search
                 freq_abs, snr = estimate_carrier(
                     block, sample_rate, center_freq,
                     fft_size=eff_fft, n_sub=n_welch_sub,
-                    search_bw=search_bw, carrier_hint=carrier_hint,
-                    hint_bw=hint_bw, excl_sidebands=excl_sidebands,
-                    oqpsk=False,
+                    search_bw=search_bw, carrier_hint=eff_hint,
+                    hint_bw=eff_hint_bw, excl_sidebands=excl_sidebands,
+                    oqpsk=False, dc_excl=dc_excl,
                 )
                 block_mode = 'C'
                 if snr < min_snr_db:
@@ -838,9 +1653,9 @@ def process_iq(
                     freq_q, snr_q = estimate_carrier(
                         block, sample_rate, center_freq,
                         fft_size=eff_fft, n_sub=n_welch_sub,
-                        search_bw=search_bw, carrier_hint=carrier_hint,
-                        hint_bw=hint_bw, excl_sidebands=False,
-                        oqpsk=True,
+                        search_bw=search_bw, carrier_hint=eff_hint,
+                        hint_bw=eff_hint_bw, excl_sidebands=False,
+                        oqpsk=True, dc_excl=dc_excl,
                     )
                     if snr_q >= min_snr_db + 2.0:   # +2 dB margin for OQPSK
                         freq_abs, snr, block_mode = freq_q, snr_q, 'Q'
@@ -848,11 +1663,11 @@ def process_iq(
                 freq_abs, snr = estimate_carrier(
                     block, sample_rate, center_freq,
                     fft_size=eff_fft, n_sub=n_welch_sub,
-                    search_bw=search_bw, carrier_hint=carrier_hint,
-                    hint_bw=hint_bw, excl_sidebands=excl_sidebands,
-                    oqpsk=oqpsk,
+                    search_bw=search_bw, carrier_hint=eff_hint,
+                    hint_bw=eff_hint_bw, excl_sidebands=excl_sidebands,
+                    oqpsk=oqpsk, centroid=centroid, dc_excl=dc_excl,
                 )
-                block_mode = 'Q' if oqpsk else 'C'
+                block_mode = 'M' if centroid else ('Q' if oqpsk else 'C')
         except Exception as e:
             if use_tty:
                 print(f"\r  [ERR] block {i+1:4d}: {e}     ")
@@ -865,6 +1680,37 @@ def process_iq(
         accepted = snr >= min_snr_db
 
         if accepted:
+            # -- Mode transition detection ------------------------------------
+            if tracking_offset is not None and probe_done:
+                jump = abs(offset - tracking_offset)
+                if jump > TRACKING_MAX_JUMP:
+                    mode_transitions.append((t, tracking_offset + center_freq, freq_abs))
+                    if use_tty:
+                        print(f"\n  [TRANSITION] block {i+1}: "
+                              f"jump {jump:+.0f} Hz "
+                              f"({tracking_offset:+.0f} -> {offset:+.0f} Hz)")
+                    else:
+                        print(f"  [TRANSITION] block {i+1}: "
+                              f"jump {jump:+.0f} Hz "
+                              f"({tracking_offset:+.0f} -> {offset:+.0f} Hz)")
+
+            # -- Update carrier tracking --------------------------------------
+            tracking_offset = offset
+            # Tracking bandwidth: ±5000 Hz initially, narrows to ±2000 Hz
+            # after we have enough measurements for drift estimation
+            if len(measurements) < 10:
+                tracking_bw = 5000.0
+            else:
+                # Estimate drift rate from last 10 measurements
+                recent = measurements[-10:]
+                dt_sec = (recent[-1][0] - recent[0][0]).total_seconds()
+                if dt_sec > 0:
+                    drift_rate = abs(recent[-1][1] - recent[0][1]) / dt_sec
+                    # bw = max(2000, 3× expected drift per block + margin)
+                    tracking_bw = max(2000.0, 3.0 * drift_rate * integration_sec + 500.0)
+                else:
+                    tracking_bw = 5000.0
+
             measurements.append((t, freq_abs, snr))
             if block_mode == 'C':
                 n_carrier_mode += 1
@@ -941,7 +1787,8 @@ def process_iq(
                                 fft_size=eff_fft, n_sub=n_welch_sub,
                                 search_bw=search_bw, carrier_hint=carrier_hint,
                                 hint_bw=hint_bw, excl_sidebands=excl_sidebands,
-                                oqpsk=oqpsk,
+                                oqpsk=oqpsk, centroid=centroid,
+                                dc_excl=dc_excl,
                             )
                             new_probe.append((t2, f2new, s2new))
                         except Exception:
@@ -999,7 +1846,8 @@ def process_iq(
                                         fft_size=eff_fft, n_sub=n_welch_sub,
                                         search_bw=search_bw, carrier_hint=carrier_hint,
                                         hint_bw=hint_bw, excl_sidebands=excl_sidebands,
-                                        oqpsk=oqpsk,
+                                        oqpsk=oqpsk, centroid=centroid,
+                                        dc_excl=dc_excl,
                                     )
                                     if snr_scan >= scan_snr_thr:
                                         found_at = scan_i
@@ -1027,7 +1875,8 @@ def process_iq(
                                             carrier_hint=carrier_hint,
                                             hint_bw=hint_bw,
                                             excl_sidebands=excl_sidebands,
-                                            oqpsk=oqpsk,
+                                            oqpsk=oqpsk, centroid=centroid,
+                                            dc_excl=dc_excl,
                                         )
                                         test_snrs.append(ts)
                                     except Exception:
@@ -1071,6 +1920,11 @@ def process_iq(
                         print(f"  New carrier hint: {carrier_hint:+.0f} Hz")
                     print(f"  Continuing from block {i+2}/{n_blocks}...\n")
 
+            # Initialize carrier tracking from probe results
+            if measurements and user_carrier_hint is None:
+                tracking_offset = measurements[-1][1] - center_freq
+                tracking_bw = 5000.0
+
     if use_tty:
         print()  # newline after final progress bar
 
@@ -1085,8 +1939,461 @@ def process_iq(
               f"mean={sum(snrs)/len(snrs):.1f} dB")
         if auto:
             print(f"  Detection modes: carrier={n_carrier_mode}  OQPSK={n_oqpsk_mode}")
+        if mode_transitions:
+            print(f"  Mode transitions: {len(mode_transitions)}")
+            for mt_t, mt_from, mt_to in mode_transitions:
+                print(f"    {_dt_to_tdm(mt_t)}: "
+                      f"{mt_from/1e6:.6f} -> {mt_to/1e6:.6f} MHz")
 
-    return measurements
+    return measurements, mode_transitions
+
+
+# ---------------------------------------------------------------------------
+# Post-processing: Horizons validation, 2-way detection, LO drift correction
+# ---------------------------------------------------------------------------
+
+# Spacecraft name → JPL Horizons SPK ID mapping
+_SPACECRAFT_SPK = {
+    'ORION': '-1023', 'ARTEMIS': '-1023',
+    'LRO': '-85',
+    'KPLO': '-155', 'DANURI': '-155',
+    'CAPSTONE': '-1176',
+    'LADEE': '-12',
+    'SLIM': '-240',
+    'WIND': '-8',
+    'ACE': '-92',
+    'SOHO': '-21',
+    'DSCOVR': '-78',
+    'STEREO-A': '-234', 'STEREOA': '-234',
+    'JWST': '-170',
+}
+
+C_KMS = 299_792.458  # speed of light [km/s]
+
+
+def _query_horizons(spk_id, site_coord, t_start_str, t_stop_str):
+    """Query JPL Horizons for range-rate and elevation.
+    Returns list of (datetime, deldot_km/s, elevation_deg) or None.
+    """
+    params = {
+        'format':      'json',
+        'COMMAND':     f"'{spk_id}'",
+        'OBJ_DATA':    "'NO'",
+        'MAKE_EPHEM':  "'YES'",
+        'TABLE_TYPE':  "'OBSERVER'",
+        'CENTER':      "'coord@399'",
+        'COORD_TYPE':  "'GEODETIC'",
+        'SITE_COORD':  f"'{site_coord}'",
+        'START_TIME':  f"'{t_start_str}'",
+        'STOP_TIME':   f"'{t_stop_str}'",
+        'STEP_SIZE':   "'1m'",
+        'QUANTITIES':  "'4,20'",
+        'CAL_FORMAT':  "'CAL'",
+        'TIME_DIGITS': "'MINUTES'",
+    }
+    url = ('https://ssd.jpl.nasa.gov/api/horizons.api?'
+           + urllib.parse.urlencode(params))
+    try:
+        with urllib.request.urlopen(url, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except Exception:
+        return None
+
+    result = data.get('result', '')
+    if 'No ephemeris' in result or 'Cannot' in result:
+        return None
+
+    rows = []
+    in_data = False
+    for line in result.splitlines():
+        if '$$SOE' in line:
+            in_data = True
+            continue
+        if '$$EOE' in line:
+            break
+        if not in_data:
+            continue
+        m = re.match(
+            r'\s*(\d{4}-\w{3}-\d{2}\s+\d{2}:\d{2})'
+            r'\s+\S+\s+([\d.]+)\s+([\d.]+)\s+[\d.]+\s+([-\d.]+)',
+            line
+        )
+        if m:
+            dt = datetime.strptime(m.group(1), '%Y-%b-%d %H:%M').replace(
+                tzinfo=timezone.utc)
+            elev = float(m.group(3))
+            deldot = float(m.group(4))
+            rows.append((dt, deldot, elev))
+    return rows if rows else None
+
+
+def _polyfit_simple(x, y, degree):
+    """Least-squares polynomial fit (pure Python). Returns [a0, a1, ..., an]."""
+    n = len(x)
+    ncols = degree + 1
+    ata = [[0.0] * ncols for _ in range(ncols)]
+    aty = [0.0] * ncols
+    for i in range(n):
+        powers = [1.0]
+        for _ in range(degree):
+            powers.append(powers[-1] * x[i])
+        for r in range(ncols):
+            for c in range(ncols):
+                ata[r][c] += powers[r] * powers[c]
+            aty[r] += powers[r] * y[i]
+    aug = [ata[r][:] + [aty[r]] for r in range(ncols)]
+    for col in range(ncols):
+        max_row = max(range(col, ncols), key=lambda r: abs(aug[r][col]))
+        aug[col], aug[max_row] = aug[max_row], aug[col]
+        pivot = aug[col][col]
+        if abs(pivot) < 1e-30:
+            raise ValueError("Singular matrix")
+        for j in range(col, ncols + 1):
+            aug[col][j] /= pivot
+        for r in range(ncols):
+            if r != col:
+                fac = aug[r][col]
+                for j in range(col, ncols + 1):
+                    aug[r][j] -= fac * aug[col][j]
+    return [aug[r][ncols] for r in range(ncols)]
+
+
+def validate_with_horizons(measurements, center_freq_hz, spacecraft_name,
+                           location_str, mode_transitions=None):
+    """Post-process: query Horizons, detect 1-way vs 2-way, estimate LO drift.
+
+    When classified coherent/non-coherent transitions are present, validates
+    each segment with its proper Doppler model (2-way for coherent, 1-way
+    for non-coherent).
+
+    Returns dict with: doppler_mode, rms, dc_offset, lo_drift_hz_per_s,
+    corrected_measurements (or None if correction applied).
+    """
+    spk_id = _SPACECRAFT_SPK.get(spacecraft_name.upper())
+    if not spk_id:
+        print(f"\n  [validate] Unknown spacecraft '{spacecraft_name}' "
+              f"— skipping Horizons check.")
+        return None
+
+    # Convert location from lat,lon,alt to lon,lat,alt (Horizons format)
+    parts = location_str.split(',')
+    if len(parts) < 2:
+        return None
+    lat, lon = parts[0], parts[1]
+    alt = parts[2] if len(parts) >= 3 else '0'
+    # Horizons wants lon,lat,alt_km
+    try:
+        alt_km = float(alt) / 1000.0 if float(alt) > 10 else float(alt)
+    except ValueError:
+        alt_km = 0.0
+    site_coord = f"{lon},{lat},{alt_km}"
+
+    # Ensure query window is at least 2 minutes for Horizons step_size='1m'
+    t0_q = measurements[0][0] - timedelta(minutes=1)
+    t1_q = measurements[-1][0] + timedelta(minutes=1)
+    t_start = t0_q.strftime('%Y-%m-%d %H:%M')
+    t_stop = t1_q.strftime('%Y-%m-%d %H:%M')
+
+    print(f"\n  [validate] Querying JPL Horizons for {spacecraft_name} "
+          f"(SPK {spk_id})...", end='', flush=True)
+    hor = _query_horizons(spk_id, site_coord, t_start, t_stop)
+    if not hor:
+        print(" no ephemeris available.")
+        return None
+    print(f" {len(hor)} points.")
+
+    # Check for transponder transitions → per-segment validation
+    # Dispatch for ANY transition (including 'unknown' from drift-rate classifier)
+    # — _validate_segments will self-classify using Horizons 1-way vs 2-way RMS
+    if mode_transitions:
+        return _validate_segments(measurements, center_freq_hz, hor,
+                                  mode_transitions)
+
+    # --- Single-segment: test 1-way and 2-way ---
+    best = None
+    for mode, scale in [('1-way', 1.0), ('2-way', 2.0)]:
+        hor_dop = [(t, scale * (-dd * center_freq_hz / C_KMS))
+                   for t, dd, _ in hor]
+
+        pairs = []
+        for t_m, f_m, _ in measurements:
+            f_offset = f_m - center_freq_hz  # offset from SDR center
+            best_dt, best_hf = None, None
+            for t_h, d_h in hor_dop:
+                dt = abs((t_m - t_h).total_seconds())
+                if dt <= 90 and (best_dt is None or dt < best_dt):
+                    best_dt = dt
+                    best_hf = d_h
+            if best_hf is not None:
+                pairs.append((t_m, f_offset, best_hf, f_offset - best_hf))
+
+        if not pairs:
+            continue
+
+        diffs = [p[3] for p in pairs]
+        dc = sum(diffs) / len(diffs)
+        res = [d - dc for d in diffs]
+        rms_c = math.sqrt(sum(r**2 for r in res) / len(res))
+
+        # Try linear LO drift compensation
+        rms_best = rms_c
+        drift_rate = 0.0
+        drift_coeffs = None
+        if len(pairs) >= 20 and rms_c > 100.0:
+            try:
+                t0 = pairs[0][0]
+                t_sec = [(p[0] - t0).total_seconds() for p in pairs]
+                coeffs = _polyfit_simple(t_sec, diffs, 1)
+                rate = abs(coeffs[1])
+                if rate > 0.1:
+                    vals = [coeffs[0] + coeffs[1]*t for t in t_sec]
+                    r_lin = [d - v for d, v in zip(diffs, vals)]
+                    rms_l = math.sqrt(sum(r**2 for r in r_lin) / len(r_lin))
+                    if rms_l < rms_c * 0.7:
+                        rms_best = rms_l
+                        drift_rate = coeffs[1]
+                        drift_coeffs = coeffs
+                        dc = coeffs[0]
+            except Exception:
+                pass
+
+        if best is None or rms_best < best['rms']:
+            best = {
+                'mode': mode,
+                'rms': rms_best,
+                'rms_const': rms_c,
+                'dc_offset': dc,
+                'drift_rate': drift_rate,
+                'drift_coeffs': drift_coeffs,
+                'n_pairs': len(pairs),
+                'pairs': pairs,
+            }
+
+    if not best:
+        print("  [validate] No time overlap with Horizons.")
+        return None
+
+    # Report
+    print(f"  [validate] Doppler mode    : {best['mode']}")
+    print(f"  [validate] DC offset       : {best['dc_offset']:+.1f} Hz")
+    tx_freq = center_freq_hz + best['dc_offset']
+    print(f"  [validate] TX frequency    : {tx_freq/1e6:.6f} MHz")
+    print(f"  [validate] RMS residual    : {best['rms']:.1f} Hz")
+    if best['drift_coeffs']:
+        print(f"  [validate] LO drift        : "
+              f"{best['drift_rate']:+.2f} Hz/s "
+              f"({best['drift_rate']*60:+.1f} Hz/min)")
+        print(f"  [validate] RMS (no drift)  : {best['rms_const']:.1f} Hz")
+
+    # Apply LO drift correction to measurements
+    corrected = None
+    if best['drift_coeffs']:
+        t0 = measurements[0][0]
+        corrected = []
+        c = best['drift_coeffs']
+        for t_m, f_m, snr in measurements:
+            dt = (t_m - t0).total_seconds()
+            lo_correction = c[1] * dt
+            corrected.append((t_m, f_m - lo_correction, snr))
+        print(f"  [validate] Applied LO drift correction to {len(corrected)} "
+              f"measurements.")
+
+    best['corrected'] = corrected
+    return best
+
+
+def _validate_segments(measurements, center_freq_hz, hor, transitions):
+    """Per-segment validation: try both 1-way and 2-way for each segment,
+    pick the mode that gives the lowest RMS per segment."""
+    C_KMS = 299792.458
+
+    # Split measurements at transition points
+    seg_boundaries = [0]
+    for ct in transitions:
+        t_trans = ct[0]
+        for mi, (mt, _, _) in enumerate(measurements):
+            if mt > t_trans and mi > seg_boundaries[-1]:
+                seg_boundaries.append(mi)
+                break
+    seg_boundaries.append(len(measurements))
+
+    raw_segments = []
+    for si in range(len(seg_boundaries) - 1):
+        seg_meas = measurements[seg_boundaries[si]:seg_boundaries[si+1]]
+        if seg_meas:
+            raw_segments.append(seg_meas)
+
+    def _eval_segment(seg_meas, scale):
+        """Evaluate segment with given Doppler scale, return (rms, dc, pairs)."""
+        hor_dop = [(t, scale * (-dd * center_freq_hz / C_KMS))
+                   for t, dd, _ in hor]
+        pairs = []
+        for t_m, f_m, _ in seg_meas:
+            f_offset = f_m - center_freq_hz
+            best_dt, best_hf = None, None
+            for t_h, d_h in hor_dop:
+                dt = abs((t_m - t_h).total_seconds())
+                if dt <= 90 and (best_dt is None or dt < best_dt):
+                    best_dt = dt
+                    best_hf = d_h
+            if best_hf is not None:
+                pairs.append((t_m, f_offset, best_hf, f_offset - best_hf))
+        if not pairs:
+            return 1e12, 0.0, []
+        diffs = [p[3] for p in pairs]
+        dc = sum(diffs) / len(diffs)
+        res = [d - dc for d in diffs]
+        rms = math.sqrt(sum(r**2 for r in res) / len(res))
+        return rms, dc, pairs
+
+    # For each segment, pick the mode (1-way or 2-way) with lowest RMS
+    seg_results = []
+    total_rms_num = 0.0
+    total_n = 0
+    classified_transitions = []
+
+    for si, seg_meas in enumerate(raw_segments):
+        rms_1, dc_1, pairs_1 = _eval_segment(seg_meas, 1.0)
+        rms_2, dc_2, pairs_2 = _eval_segment(seg_meas, 2.0)
+
+        if rms_2 < rms_1 * 0.7:
+            smode, doppler, rms, dc, pairs = ('coherent', '2-way',
+                                               rms_2, dc_2, pairs_2)
+        else:
+            smode, doppler, rms, dc, pairs = ('non-coherent', '1-way',
+                                               rms_1, dc_1, pairs_1)
+
+        tx_freq = center_freq_hz + dc
+        t0_seg = seg_meas[0][0].strftime('%H:%M:%S')
+        t1_seg = seg_meas[-1][0].strftime('%H:%M:%S')
+        print(f"  [validate] Segment {si+1}: {smode} ({doppler}) "
+              f"{t0_seg}-{t1_seg}: "
+              f"{len(pairs)} pts, RMS={rms:.1f} Hz, "
+              f"DC={dc:+.1f} Hz, TX={tx_freq/1e6:.6f} MHz"
+              f"  (1-way RMS={rms_1:.1f}, 2-way RMS={rms_2:.1f})")
+
+        res = [p[3] - dc for p in pairs]
+        total_rms_num += sum(r**2 for r in res)
+        total_n += len(res)
+
+        seg_results.append({
+            'mode': doppler,
+            'transponder': smode,
+            'rms': rms,
+            'dc_offset': dc,
+            'n_pairs': len(pairs),
+        })
+
+        # Build classified transition labels
+        if si > 0:
+            prev_mode = seg_results[si - 1]['transponder']
+            if prev_mode == 'coherent' and smode == 'non-coherent':
+                label = 'coh_to_noncoh'
+            elif prev_mode == 'non-coherent' and smode == 'coherent':
+                label = 'noncoh_to_coh'
+            else:
+                label = 'unknown'
+            if si - 1 < len(transitions):
+                t = transitions[si - 1]
+                classified_transitions.append(
+                    (t[0], t[1], t[2], label))
+
+    if total_n > 0:
+        combined_rms = math.sqrt(total_rms_num / total_n)
+        print(f"  [validate] Combined RMS    : {combined_rms:.1f} Hz "
+              f"({total_n} pts)")
+    else:
+        combined_rms = 0.0
+
+    return {
+        'mode': 'per-segment',
+        'rms': combined_rms,
+        'rms_const': combined_rms,
+        'dc_offset': 0.0,
+        'drift_rate': 0.0,
+        'drift_coeffs': None,
+        'n_pairs': total_n,
+        'pairs': [],
+        'corrected': None,
+        'segments': seg_results,
+        'classified_transitions': classified_transitions,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Coherent / non-coherent transponder classification
+# ---------------------------------------------------------------------------
+
+def _classify_transponder_transitions(measurements, transitions, integration_sec):
+    """Classify mode transitions as coherent→non-coherent or vice versa.
+
+    In coherent mode (DSN uplink locked), observed Doppler ≈ 2× one-way.
+    At a coherent→non-coherent transition the drift rate approximately halves.
+    """
+    if not transitions or len(measurements) < 100:
+        return transitions
+
+    freqs = [m[1] for m in measurements]
+    times_s = [(m[0] - measurements[0][0]).total_seconds() for m in measurements]
+
+    def _drift_rate(i_start, i_end):
+        """Linear regression slope (Hz/s) over measurement indices."""
+        n = i_end - i_start
+        if n < 10:
+            return None
+        dt = times_s[i_end - 1] - times_s[i_start]
+        if dt < 5:
+            return None
+        t = [times_s[j] - times_s[i_start] for j in range(i_start, i_end)]
+        f = [freqs[j] for j in range(i_start, i_end)]
+        st = sum(t); sf = sum(f)
+        stt = sum(ti * ti for ti in t)
+        stf = sum(ti * fi for ti, fi in zip(t, f))
+        det = n * stt - st * st
+        if abs(det) < 1e-12:
+            return None
+        return (n * stf - st * sf) / det
+
+    classified = []
+    for trans in transitions:
+        t_trans = trans[0]
+        t_s = (t_trans - measurements[0][0]).total_seconds()
+        idx = min(range(len(times_s)), key=lambda i: abs(times_s[i] - t_s))
+
+        # Windows: before = 60 pts ending 5 before transition
+        #          after  = 60 pts starting 90 after (skip settling)
+        win = min(60, max(10, idx // 2))
+        skip = 90
+
+        ib_end = max(0, idx - 5)
+        ib_start = max(0, ib_end - win)
+        ia_start = min(len(measurements), idx + skip)
+        ia_end = min(len(measurements), ia_start + win)
+
+        rate_before = _drift_rate(ib_start, ib_end)
+        rate_after = _drift_rate(ia_start, ia_end)
+
+        label = 'unknown'
+        if (rate_before is not None and rate_after is not None
+                and abs(rate_after) > 0.3):
+            ratio = abs(rate_before) / abs(rate_after)
+            if 1.3 <= ratio <= 3.5:
+                label = 'coh_to_noncoh'
+            elif 0.3 <= ratio <= 0.75:
+                label = 'noncoh_to_coh'
+            print(f"  [transponder] Transition at {_dt_to_tdm(t_trans)}: "
+                  f"rate before={rate_before:+.2f} Hz/s, "
+                  f"after={rate_after:+.2f} Hz/s, "
+                  f"ratio={ratio:.2f} → {label}")
+        else:
+            reason = ("rates too small" if rate_before is not None
+                      else "insufficient data")
+            print(f"  [transponder] Transition at {_dt_to_tdm(t_trans)}: "
+                  f"{reason} → {label}")
+
+        classified.append((trans[0], trans[1], trans[2], label))
+
+    return classified
 
 
 # ---------------------------------------------------------------------------
@@ -1095,71 +2402,174 @@ def process_iq(
 
 def write_tdm(measurements, output_path, station_name, center_freq_hz,
               integration_sec, originator=None, dsn_station=None, comment=None,
-              participant_1=None):
-    """Write CCSDS TDM v2.0 KVN file."""
+              participant_1=None, mode_transitions=None):
+    """Write CCSDS TDM v2.0 KVN file.
+
+    When classified coherent/non-coherent transitions are present, writes
+    multiple observation data segments (separate META+DATA blocks per CCSDS
+    503.0-B-2 section 3.1).
+    """
     if not measurements:
         raise ValueError("No measurements to write")
 
     freq_offset = round(center_freq_hz)
-    t_start = measurements[0][0]
-    t_stop  = measurements[-1][0]
     now_utc = datetime.now(timezone.utc)
     orig    = originator or station_name
 
     p1 = participant_1 or "ORION"
     if dsn_station:
-        parts      = [f"PARTICIPANT_1          = {dsn_station}",
+        part_lines = [f"PARTICIPANT_1          = {dsn_station}",
                       f"PARTICIPANT_2          = {p1}",
                       f"PARTICIPANT_3          = {station_name}"]
         path_str   = "1,2,3"
         data_kw    = "RECEIVE_FREQ_3"
     else:
-        parts      = [f"PARTICIPANT_1          = {p1}",
+        part_lines = [f"PARTICIPANT_1          = {p1}",
                       f"PARTICIPANT_2          = {station_name}"]
         path_str   = "1,2"
         data_kw    = "RECEIVE_FREQ_2"
 
+    # Check for classified transponder transitions
+    classified = [t for t in (mode_transitions or [])
+                  if len(t) >= 4 and t[3] in ('coh_to_noncoh', 'noncoh_to_coh')]
+
+    # --- Header (CCSDS 503.0-B-2 section 3.2, table 3-2) ---
     lines = [
         "CCSDS_TDM_VERS = 2.0",
-        f"CREATION_DATE  = {_dt_to_tdm(now_utc)}Z",
-        f"ORIGINATOR     = {orig}",
-        "",
     ]
     if comment:
         for ln in comment.strip().splitlines():
             lines.append(f"COMMENT {ln}")
-        lines.append("")
-
     lines += [
-        "META_START",
-        "TIME_SYSTEM            = UTC",
-        *parts,
-        "MODE                   = SEQUENTIAL",
-        f"PATH                   = {path_str}",
-        f"INTEGRATION_INTERVAL   = {integration_sec:.1f}",
-        "INTEGRATION_REF        = END",
-        f"FREQ_OFFSET            = {freq_offset:.1f}",
-        f"START_TIME             = {_dt_to_tdm(t_start)}",
-        f"STOP_TIME              = {_dt_to_tdm(t_stop)}",
-        f"TURNAROUND_NUMERATOR   = {TURNAROUND_NUMERATOR}",
-        f"TURNAROUND_DENOMINATOR = {TURNAROUND_DENOMINATOR}",
-        "META_STOP",
+        f"CREATION_DATE  = {_dt_to_tdm(now_utc)}Z",
+        f"ORIGINATOR     = {orig}",
         "",
-        "DATA_START",
     ]
-    for (t, fa, snr) in measurements:
-        lines.append(f"{data_kw} = {_dt_to_tdm(t)}  {fa - freq_offset:+.3f}")
-    lines += ["DATA_STOP", ""]
+
+    if classified:
+        # --- Multi-segment output (coherent / non-coherent) ---
+        # Determine mode of first segment from the first transition
+        first_label = classified[0][3]
+        first_mode = ('coherent' if first_label == 'coh_to_noncoh'
+                      else 'non-coherent')
+
+        # Build list of (start_idx, end_idx, mode) segments
+        segments = []
+        seg_start = 0
+        current_mode = first_mode
+        for ct in classified:
+            t_trans = ct[0]
+            # Find split index: first measurement AFTER transition time
+            split_idx = None
+            for mi, (mt, _, _) in enumerate(measurements):
+                if mt > t_trans and mi > seg_start:
+                    split_idx = mi
+                    break
+            if split_idx is None:
+                continue
+            segments.append((seg_start, split_idx, current_mode))
+            seg_start = split_idx
+            current_mode = ('non-coherent' if current_mode == 'coherent'
+                            else 'coherent')
+        # Last segment
+        segments.append((seg_start, len(measurements), current_mode))
+
+        seg_info = []
+        for si, se, smode in segments:
+            seg_meas = measurements[si:se]
+            if not seg_meas:
+                continue
+            t_start = seg_meas[0][0]
+            t_stop  = seg_meas[-1][0]
+            is_coh  = (smode == 'coherent')
+
+            mode_comment = (
+                "Coherent transponder (2-way Doppler)"
+                if is_coh else
+                "Non-coherent transponder (1-way Doppler)"
+            )
+
+            lines += [
+                "META_START",
+                f"COMMENT {mode_comment}",
+                "TIME_SYSTEM            = UTC",
+                f"START_TIME             = {_dt_to_tdm(t_start)}",
+                f"STOP_TIME              = {_dt_to_tdm(t_stop)}",
+                *part_lines,
+                "MODE                   = SEQUENTIAL",
+                f"PATH                   = {path_str}",
+            ]
+            if is_coh:
+                lines += [
+                    f"TURNAROUND_NUMERATOR   = {TURNAROUND_NUMERATOR}",
+                    f"TURNAROUND_DENOMINATOR = {TURNAROUND_DENOMINATOR}",
+                ]
+            lines += [
+                f"INTEGRATION_INTERVAL   = {integration_sec:.1f}",
+                "INTEGRATION_REF        = END",
+                f"FREQ_OFFSET            = {freq_offset:.1f}",
+                "META_STOP",
+                "",
+                "DATA_START",
+            ]
+            for (t, fa, snr) in seg_meas:
+                lines.append(
+                    f"{data_kw} = {_dt_to_tdm(t)}  {fa - freq_offset:+.3f}")
+            lines += ["DATA_STOP", ""]
+
+            seg_info.append((smode, len(seg_meas),
+                             (t_stop - t_start).total_seconds()))
+    else:
+        # --- Single-segment output (original behavior) ---
+        t_start = measurements[0][0]
+        t_stop  = measurements[-1][0]
+
+        lines += [
+            "META_START",
+            "TIME_SYSTEM            = UTC",
+            f"START_TIME             = {_dt_to_tdm(t_start)}",
+            f"STOP_TIME              = {_dt_to_tdm(t_stop)}",
+            *part_lines,
+            "MODE                   = SEQUENTIAL",
+            f"PATH                   = {path_str}",
+            f"TURNAROUND_NUMERATOR   = {TURNAROUND_NUMERATOR}",
+            f"TURNAROUND_DENOMINATOR = {TURNAROUND_DENOMINATOR}",
+            f"INTEGRATION_INTERVAL   = {integration_sec:.1f}",
+            "INTEGRATION_REF        = END",
+            f"FREQ_OFFSET            = {freq_offset:.1f}",
+            "META_STOP",
+            "",
+        ]
+
+        lines.append("DATA_START")
+        if mode_transitions:
+            for mt in mode_transitions:
+                mt_t, mt_freq = mt[0], mt[1]
+                mt_info = mt[2] if len(mt) >= 3 else mt_freq
+                lines.append(f"COMMENT Mode transition at {_dt_to_tdm(mt_t)} "
+                             f"near {mt_freq/1e6:.6f} MHz ({mt_info})")
+        for (t, fa, snr) in measurements:
+            lines.append(
+                f"{data_kw} = {_dt_to_tdm(t)}  {fa - freq_offset:+.3f}")
+        lines += ["DATA_STOP", ""]
+
+        seg_info = None
 
     with open(output_path, "w", encoding="ascii") as f:
         f.write("\n".join(lines))
 
-    dur = (t_stop - t_start).total_seconds()
+    dur = (measurements[-1][0] - measurements[0][0]).total_seconds()
     print(f"\n{'='*64}")
     print(f"  TDM written  : {output_path}")
     print(f"  Measurements : {len(measurements)}")
     print(f"  Duration     : {dur:.0f} s ({dur/60:.1f} min)")
-    print(f"  Mode         : {'3-way ('+dsn_station+')' if dsn_station else '1-way'}")
+    if seg_info:
+        for smode, sn, sdur in seg_info:
+            print(f"  Segment      : {smode} — {sn} pts, "
+                  f"{sdur:.0f} s ({sdur/60:.1f} min)")
+    else:
+        print(f"  Mode         : "
+              f"{'3-way ('+dsn_station+')' if dsn_station else '1-way'}")
     print(f"{'='*64}")
 
 
@@ -1274,6 +2684,34 @@ def build_parser():
                        "OQPSK IQ^4 recovery (Artemis II). "
                        "Useful when the signal type is unknown."
                    ))
+    p.add_argument("--centroid", action="store_true",
+                   help=(
+                       "Spectral centroid mode for modulated signals (BPSK/QPSK telemetry). "
+                       "Instead of finding a single CW peak, tracks the power-weighted "
+                       "center frequency of the signal band. "
+                       "Use with --carrier-hint and --hint-bw to define the search window. "
+                       "Works for SOHO, spacecraft with suppressed carrier, etc."
+                   ))
+    p.add_argument("--weak", action="store_true",
+                   help=(
+                       "Weak signal mode (Viterbi ridge tracker). "
+                       "Builds a spectrogram and finds the optimal frequency track "
+                       "using dynamic programming, exploiting signal continuity across "
+                       "time frames. Can detect signals below per-frame noise floor "
+                       "(visible on waterfall but not in single-frame PSD). "
+                       "Use with --carrier-hint and --hint-bw to limit search region. "
+                       "Use --max-drift to set max Doppler rate [Hz/s] (default: 10)."
+                   ))
+    p.add_argument("--max-drift", type=float, default=10.0,
+                   help=(
+                       "Maximum Doppler drift rate [Hz/s] for --weak mode (default: 10). "
+                       "Spacecraft at L1/L2: ~1-5 Hz/s, lunar: ~5-50 Hz/s."
+                   ))
+    p.add_argument("--weak-stack", type=int, default=1,
+                   help=(
+                       "Stack K consecutive frames before ridge tracking in --weak mode "
+                       "(default: 1, no stacking). Use 3-10 for extra SNR boost."
+                   ))
     p.add_argument("--max-samples",  type=int,  default=None,
                    help="Load only first N samples (for testing on large files)")
     p.add_argument("--skip-samples", type=int,  default=None,
@@ -1382,7 +2820,7 @@ def main():
                       duration_sec=min(120.0, len(iq)/sr))
 
     # -- Main processing ----------------------------------------------------
-    meas = process_iq(
+    meas, transitions = process_iq(
         iq, sr, cf, t0,
         integration_sec = args.integration,
         fft_size        = args.fft_size,
@@ -1395,12 +2833,21 @@ def main():
         interactive     = not args.no_interactive,
         oqpsk           = args.oqpsk,
         auto            = args.auto,
+        centroid        = args.centroid,
+        weak            = args.weak,
+        max_drift       = args.max_drift,
+        weak_stack      = args.weak_stack,
     )
 
     if not meas:
         print("\nERROR: No measurements -- signal too weak or SNR threshold too high.")
         print("Try: --min-snr 1.5  --welch-sub 100  --carrier-hint <Hz>")
         sys.exit(1)
+
+    # -- Classify transponder transitions -----------------------------------
+    if transitions:
+        transitions = _classify_transponder_transitions(
+            meas, transitions, args.integration)
 
     # -- Write TDM ----------------------------------------------------------
     sc = args.spacecraft or "ORION"
@@ -1418,7 +2865,7 @@ def main():
             ew = "E" if lon >= 0 else "W"
             loc_line = f"Station: {args.station} ({abs(lat):.2f}{ns}, {abs(lon):.2f}{ew}{alt})\n"
     auto_cmt = (
-        f"{args.spacecraft or 'ORION'} one-way Doppler tracking\n"
+        f"{args.spacecraft or 'ORION'} Doppler tracking\n"
         f"{loc_line}"
         f"Source: {inp.name}\n"
         f"HW: {info.get('hw','?')} | "
@@ -1427,8 +2874,32 @@ def main():
     )
     write_tdm(meas, out, args.station, cf, args.integration,
               args.originator, args.dsn_station, args.comment or auto_cmt,
-              participant_1=args.spacecraft)
+              participant_1=args.spacecraft, mode_transitions=transitions)
 
+    # -- Post-processing: Horizons validation ----------------------------------
+    if args.spacecraft and args.location:
+        val = validate_with_horizons(meas, cf, args.spacecraft, args.location,
+                                     mode_transitions=transitions)
+        if val and val.get('classified_transitions'):
+            # Horizons self-classified segments → rewrite TDM with proper labels
+            ct = val['classified_transitions']
+            print(f"\n  [rewrite] Rewriting TDM with Horizons-classified "
+                  f"transponder segments...")
+            write_tdm(meas, out, args.station, cf,
+                      args.integration, args.originator, args.dsn_station,
+                      args.comment or auto_cmt, participant_1=args.spacecraft,
+                      mode_transitions=ct)
+        elif val and val.get('corrected'):
+            # Rewrite TDM with LO-drift-corrected measurements
+            drift_cmt = (
+                f"{auto_cmt}\n"
+                f"LO drift corrected: {val['drift_rate']:+.2f} Hz/s "
+                f"({val['mode']} Doppler, RMS {val['rms']:.1f} Hz)"
+            )
+            write_tdm(val['corrected'], out, args.station, cf,
+                      args.integration, args.originator, args.dsn_station,
+                      drift_cmt, participant_1=args.spacecraft,
+                      mode_transitions=transitions)
 
 
 if __name__ == "__main__":
