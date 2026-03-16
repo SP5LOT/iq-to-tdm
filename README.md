@@ -4,7 +4,7 @@ Converts amateur radio SDR IQ recordings to NASA CCSDS Tracking Data Message (TD
 for submission to NASA Artemis II and lunar mission Doppler tracking programs.
 
 **Station:** SP5LOT — Warsaw, Poland
-**Missions:** Artemis I/II (Orion), KPLO/Danuri, LRO
+**Tracked spacecraft:** Artemis I/II (Orion), KPLO/Danuri, LRO, SOHO
 
 ---
 
