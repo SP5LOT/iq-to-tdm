@@ -80,6 +80,20 @@ def read_sigmf_meta(meta_path):
     dt_str      = cap.get("core:datetime") or g.get("core:datetime") or ""
     start_time  = _parse_dt(dt_str) if dt_str else None
 
+    # Build PPS lookup table: list of (sample_index, datetime) sorted by sample_index
+    all_captures = meta.get("captures", [])
+    pps_table = []
+    for c in all_captures:
+        s = c.get("core:sample_start")
+        d = c.get("core:datetime")
+        if s is not None and d:
+            try:
+                pps_table.append((int(s), _parse_dt(d)))
+            except Exception:
+                pass
+    pps_table.sort(key=lambda x: x[0])
+    pps_count = max(0, len(pps_table) - 1)
+
     return {
         "datatype":    datatype,
         "sample_rate": sample_rate,
@@ -87,6 +101,8 @@ def read_sigmf_meta(meta_path):
         "start_time":  start_time,
         "hw":          g.get("core:hw", ""),
         "description": g.get("core:description", ""),
+        "pps_captures": pps_count,
+        "pps_table":   pps_table,   # [(sample_idx, datetime), ...]
     }
 
 
@@ -473,6 +489,47 @@ def _dt_to_tdm(dt):
             f"{dt.microsecond // 1000:03d}")
 
 
+def _make_pps_interp(pps_table, sample_rate, start_time):
+    """Return a function t(sample_index) -> datetime using PPS-anchored interpolation.
+
+    If pps_table has ≥2 entries, interpolates between the two nearest PPS anchors
+    for GPS-accurate timestamps.  Falls back to linear extrapolation from start_time
+    when no PPS data is available or sample_index is out of range.
+    """
+    if len(pps_table) < 2:
+        # No PPS — linear from start_time using nominal sample rate
+        def _linear(sample_idx):
+            return start_time + timedelta(seconds=sample_idx / sample_rate)
+        return _linear
+
+    # Build arrays for fast binary search
+    pps_samples = [s for s, _ in pps_table]
+    pps_times   = [t for _, t in pps_table]
+
+    def _pps_interp(sample_idx):
+        import bisect
+        pos = bisect.bisect_right(pps_samples, sample_idx) - 1
+        if pos < 0:
+            # Before first PPS anchor — extrapolate backward
+            s0, t0 = pps_samples[0], pps_times[0]
+            return t0 + timedelta(seconds=(sample_idx - s0) / sample_rate)
+        if pos >= len(pps_samples) - 1:
+            # After last PPS anchor — extrapolate forward
+            s0, t0 = pps_samples[-1], pps_times[-1]
+            return t0 + timedelta(seconds=(sample_idx - s0) / sample_rate)
+        # Interpolate between two adjacent PPS anchors
+        s0, t0 = pps_samples[pos],     pps_times[pos]
+        s1, t1 = pps_samples[pos + 1], pps_times[pos + 1]
+        span_samp = s1 - s0
+        span_sec  = (t1 - t0).total_seconds()
+        if span_samp <= 0:
+            return t0
+        frac = (sample_idx - s0) / span_samp
+        return t0 + timedelta(seconds=frac * span_sec)
+
+    return _pps_interp
+
+
 # ---------------------------------------------------------------------------
 # DSP core: Welch periodogram
 # ---------------------------------------------------------------------------
@@ -723,6 +780,9 @@ def _viterbi_ridge(psd_db, freq_axis, max_drift_hz_per_step, stack_k=1):
         n_stacked = n_frames
 
     nf, nb = psd_work.shape
+
+    if nf == 0 or nb == 0:
+        return np.zeros(n_frames), np.zeros(n_frames)
 
     # Noise floor per frame (median across bins)
     noise_floor = np.median(psd_work, axis=1, keepdims=True)
@@ -1104,6 +1164,10 @@ def process_iq(
     weak            = False,
     max_drift       = 10.0,
     weak_stack      = 1,
+    refine_bw       = 500.0,
+    fade_timeout    = None,
+    pps_table       = None,   # [(sample_idx, datetime), ...] for GPS-accurate timestamps
+    burst_blank_db  = None,   # float: blank integration blocks whose power exceeds median+N dB
 ):
     """
     Slide integration window and collect carrier frequency measurements.
@@ -1120,6 +1184,9 @@ def process_iq(
     eff_fft = max(1024, 2 ** int(math.log2(eff_fft)))
     n_blocks = len(iq) // spb
     bin_hz   = sample_rate / eff_fft
+
+    # PPS-accurate timestamp function
+    _pps_t = _make_pps_interp(pps_table or [], sample_rate, start_time)
 
     if search_bw is None:
         search_bw = sample_rate * 0.80
@@ -1501,15 +1568,14 @@ def process_iq(
         accum_snr_db = 10.0 * math.log10(max(1.0, accum_snr_linear))
         weak_accept_all = accum_snr_db >= 6.0
 
-        # CW refinement bandwidth: ±500 Hz around Viterbi position
+        # CW refinement bandwidth: ±refine_bw Hz around Viterbi position
         # (in actual freq domain, not IQ^4 domain — estimate_carrier handles
         #  the ×4 internally when oqpsk=True)
-        refine_bw = 500.0
         n_refined = 0
         measurements = []
         skipped = 0
         for i in range(min(len(track_freq), n_blocks)):
-            t = start_time + timedelta(seconds=(i + 1) * integration_sec)
+            t = _pps_t((i + 1) * spb)   # END of integration window, PPS-corrected
             viterbi_freq = center_freq + track_freq[i]
             viterbi_snr = float(track_snr[i])
             viterbi_offset = track_freq[i]
@@ -1536,6 +1602,7 @@ def process_iq(
                 except Exception:
                     pass
 
+
             offset = freq_abs - center_freq
             if weak_accept_all or snr >= min_snr_db:
                 measurements.append((t, freq_abs, snr))
@@ -1549,6 +1616,16 @@ def process_iq(
                 print(f"  [{tag:>2s}]{r_tag}{i+1:5d}/{n_blocks}  "
                       f"{t.strftime('%Y-%jT%H:%M:%S.') + f'{t.microsecond//1000:03d}':26s}"
                       f"  offset={offset:+10.2f} Hz  SNR={snr:5.1f} dB")
+
+            # Fade-out early stop: if fade_timeout set, check for sustained low-SNR
+            # In weak mode tag is always "[OK]", so check SNR directly instead.
+            if fade_timeout is not None and (tag == "--" or snr < min_snr_db):
+                fade_blocks = int(fade_timeout / integration_sec)
+                recent = track_snr[max(0, i - fade_blocks + 1):i + 1]
+                if len(recent) >= fade_blocks and all(s < min_snr_db for s in recent):
+                    print(f"\n  [fade] Signal lost for {fade_timeout:.0f}s at "
+                          f"{t.strftime('%H:%M:%S')} — stopping early.")
+                    break
 
         n_ok = len(measurements)
         print(f"\n  Accepted: {n_ok}/{n_blocks}  (skipped: {skipped})")
@@ -1596,7 +1673,7 @@ def process_iq(
                       f"{mt_from/1e6:.6f} MHz "
                       f"(drift rate reversal)")
 
-        return measurements, weak_transitions
+        return measurements, weak_transitions, n_welch_sub
 
     measurements = []
     skipped = 0
@@ -1624,10 +1701,30 @@ def process_iq(
 
     t0_proc = time.time()
 
+    # Pre-compute burst blank threshold from first 10% of blocks (vectorized)
+    _burst_thresh = None
+    if burst_blank_db is not None:
+        _n_est = max(1, min(n_blocks // 10, 500))
+        _est_data = iq[:_n_est * spb].view(np.float32)
+        _pwr_est = (_est_data ** 2).reshape(_n_est, spb * 2).mean(axis=1)
+        _burst_thresh = float(np.median(_pwr_est)) * (10 ** (burst_blank_db / 10.0))
+        print(f"  [blank-bursts] threshold={burst_blank_db:.0f} dB above median "
+              f"(pwr threshold={10*np.log10(_burst_thresh+1e-30):.1f} dBfs)")
+    _burst_blanked = 0
+
     for i in range(n_blocks):
         block = iq[i*spb : (i+1)*spb]
-        # Timestamp = end of integration window
-        t = start_time + timedelta(seconds=(i + 1) * integration_sec)
+        # Timestamp = end of integration window, PPS-corrected when available
+        t = _pps_t((i + 1) * spb)
+
+        # Burst blanking: skip block if RFI power exceeds threshold
+        if _burst_thresh is not None:
+            blk_f = block.view(np.float32)
+            blk_pwr = float((blk_f ** 2).mean())
+            if blk_pwr > _burst_thresh:
+                _burst_blanked += 1
+                skipped += 1
+                continue
 
         # Carrier tracking: after probe phase, use tracking hint to follow signal
         eff_hint = carrier_hint
@@ -1855,7 +1952,7 @@ def process_iq(
                                     pass
                             if found_at is not None:
                                 onset_sec = found_at * integration_sec
-                                onset_t = start_time + timedelta(seconds=onset_sec)
+                                onset_t = _pps_t(found_at * spb)
                                 print(f"  [adaptive] signal found at block "
                                       f"{found_at+1}/{n_blocks} "
                                       f"(~{onset_sec/60:.1f} min into recording, "
@@ -1928,6 +2025,9 @@ def process_iq(
         print()  # newline after final progress bar
 
     print(f"\n  Accepted: {len(measurements)}/{n_blocks}  (skipped: {skipped})")
+    if _burst_blanked > 0:
+        print(f"  Burst-blanked  : {_burst_blanked}/{n_blocks} blocks "
+              f"({100*_burst_blanked/n_blocks:.1f}%)")
 
     if measurements:
         offsets = [m[1]-center_freq for m in measurements]
@@ -1944,7 +2044,7 @@ def process_iq(
                 print(f"    {_dt_to_tdm(mt_t)}: "
                       f"{mt_from/1e6:.6f} -> {mt_to/1e6:.6f} MHz")
 
-    return measurements, mode_transitions
+    return measurements, mode_transitions, n_welch_sub
 
 
 # ---------------------------------------------------------------------------
@@ -1967,8 +2067,19 @@ _SPACECRAFT_SPK = {
     'JWST': '-170',
 }
 
-C_KMS = 299_792.458  # speed of light [km/s]
+# Nominal TX frequencies (Hz) for Horizons-guided carrier hint
+_SPACECRAFT_TX_FREQ = {
+    'LRO': 2271.200e6,
+    'KPLO': 2260.800e6, 'DANURI': 2260.800e6,
+    'ACE': 2278.296e6,
+    'SOHO': 2244.932e6,
+    'WIND': 2270.400e6,
+    'DSCOVR': 2282.500e6,
+    'JWST': 2270.500e6,
+    'ORION': 2216.500e6, 'ARTEMIS': 2216.500e6,
+}
 
+C_KMS = 299_792.458  # speed of light [km/s]
 
 def _query_horizons(spk_id, site_coord, t_start_str, t_stop_str):
     """Query JPL Horizons for range-rate and elevation.
@@ -2014,16 +2125,41 @@ def _query_horizons(spk_id, site_coord, t_start_str, t_stop_str):
             continue
         m = re.match(
             r'\s*(\d{4}-\w{3}-\d{2}\s+\d{2}:\d{2})'
-            r'\s+\S+\s+([-\d.]+)\s+([-\d.]+)\s+[-\d.]+\s+([-\d.]+)',
+            r'(?:\s+[a-zA-Z/*]+)?'   # optional flag token (e.g. 'm' = near Moon)
+            r'\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)',
             line
         )
         if m:
             dt = datetime.strptime(m.group(1), '%Y-%b-%d %H:%M').replace(
                 tzinfo=timezone.utc)
-            elev = float(m.group(3))
-            deldot = float(m.group(4))
+            elev = float(m.group(3))    # group 3 = EL
+            deldot = float(m.group(5))  # group 5 = deldot (km/s)
             rows.append((dt, deldot, elev))
     return rows if rows else None
+
+
+def _interp_horizons(t_m, hor_dop):
+    """Linearly interpolate Horizons Doppler to measurement time t_m.
+    hor_dop: list of (datetime, doppler_hz) sorted by time.
+    Returns interpolated value or None if out of range (>90s from nearest)."""
+    if not hor_dop:
+        return None
+    # Find bracketing points
+    for i in range(len(hor_dop) - 1):
+        t0, d0 = hor_dop[i]
+        t1, d1 = hor_dop[i + 1]
+        if t0 <= t_m <= t1:
+            dt = (t1 - t0).total_seconds()
+            if dt == 0:
+                return d0
+            alpha = (t_m - t0).total_seconds() / dt
+            return d0 + alpha * (d1 - d0)
+    # Outside range: use nearest endpoint if within 90s
+    if abs((t_m - hor_dop[0][0]).total_seconds()) <= 90:
+        return hor_dop[0][1]
+    if abs((t_m - hor_dop[-1][0]).total_seconds()) <= 90:
+        return hor_dop[-1][1]
+    return None
 
 
 def validate_with_horizons(measurements, center_freq_hz, spacecraft_name,
@@ -2086,12 +2222,7 @@ def validate_with_horizons(measurements, center_freq_hz, spacecraft_name,
         pairs = []
         for t_m, f_m, _ in measurements:
             f_offset = f_m - center_freq_hz  # offset from SDR center
-            best_dt, best_hf = None, None
-            for t_h, d_h in hor_dop:
-                dt = abs((t_m - t_h).total_seconds())
-                if dt <= 90 and (best_dt is None or dt < best_dt):
-                    best_dt = dt
-                    best_hf = d_h
+            best_hf = _interp_horizons(t_m, hor_dop)
             if best_hf is not None:
                 pairs.append((t_m, f_offset, best_hf, f_offset - best_hf))
 
@@ -2214,6 +2345,7 @@ def validate_with_horizons(measurements, center_freq_hz, spacecraft_name,
               f"measurements.")
 
     best['corrected'] = corrected
+    best['all_pairs'] = best.get('pairs', [])
     return best
 
 
@@ -2245,12 +2377,7 @@ def _validate_segments(measurements, center_freq_hz, hor, transitions):
         pairs = []
         for t_m, f_m, _ in seg_meas:
             f_offset = f_m - center_freq_hz
-            best_dt, best_hf = None, None
-            for t_h, d_h in hor_dop:
-                dt = abs((t_m - t_h).total_seconds())
-                if dt <= 90 and (best_dt is None or dt < best_dt):
-                    best_dt = dt
-                    best_hf = d_h
+            best_hf = _interp_horizons(t_m, hor_dop)
             if best_hf is not None:
                 pairs.append((t_m, f_offset, best_hf, f_offset - best_hf))
         if not pairs:
@@ -2266,6 +2393,7 @@ def _validate_segments(measurements, center_freq_hz, hor, transitions):
     total_rms_num = 0.0
     total_n = 0
     classified_transitions = []
+    all_pairs_collected = []
 
     for si, seg_meas in enumerate(raw_segments):
         rms_1, dc_1, pairs_1 = _eval_segment(seg_meas, 1.0)
@@ -2298,6 +2426,7 @@ def _validate_segments(measurements, center_freq_hz, hor, transitions):
             'dc_offset': dc,
             'n_pairs': len(pairs),
         })
+        all_pairs_collected.extend(pairs)
 
         # Build classified transition labels
         if si > 0:
@@ -2329,6 +2458,7 @@ def _validate_segments(measurements, center_freq_hz, hor, transitions):
         'drift_coeffs': None,
         'n_pairs': total_n,
         'pairs': [],
+        'all_pairs': all_pairs_collected,
         'corrected': None,
         'segments': seg_results,
         'classified_transitions': classified_transitions,
@@ -2633,6 +2763,86 @@ def plot_spectrum(iq, sample_rate, center_freq, output_png,
     print(f"  Spectrum saved: {output_png}")
 
 
+def plot_doppler_vs_horizons(pairs, output_png, title="", rms_hz=None,
+                             center_freq_hz=None):
+    """Save Doppler comparison plot: measured vs Horizons predicted.
+
+    pairs: list of (datetime, measured_offset_Hz, horizons_offset_Hz, residual_Hz)
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+    except ImportError:
+        print("  [INFO] matplotlib not available -- skipping doppler plot")
+        return
+    if not pairs:
+        print("  [plot-doppler] No pairs to plot.")
+        return
+
+    times    = [p[0] for p in pairs]
+    cf = center_freq_hz if center_freq_hz else 0.0
+    # Convert offsets to absolute frequency in MHz
+    measured = [(p[1] + cf) / 1e6 for p in pairs]
+    hor_raw  = [(p[2] + cf) / 1e6 for p in pairs]
+    # DC = mean difference between measured and Horizons (subcarrier offset + LO offset)
+    # Add DC to Horizons so both lines sit at the same Y level — shapes are comparable
+    dc = sum(p[3] for p in pairs) / len(pairs) / 1e6  # DC in MHz
+    horizons  = [h + dc for h in hor_raw]
+    residuals = [(p[3] - dc * 1e6) for p in pairs]   # residuals stay in Hz
+
+    # Smooth measured line (visual only — TDM data unchanged)
+    # Rolling median window = 10s
+    win = 10
+    half = win // 2
+    measured_smooth = []
+    for i in range(len(measured)):
+        lo = max(0, i - half)
+        hi = min(len(measured), i + half + 1)
+        window_vals = sorted(measured[lo:hi])
+        measured_smooth.append(window_vals[len(window_vals) // 2])
+
+    # Smooth Horizons line: low-degree polynomial fit to remove piecewise-linear kinks
+    # (Horizons is 1-min resolution; linear interpolation produces visible kinks)
+    t_sec = [(t - times[0]).total_seconds() for t in times]
+    try:
+        deg = min(6, max(3, len(times) // 200))
+        coeffs = np.polyfit(t_sec, horizons, deg)
+        horizons_smooth = list(np.polyval(coeffs, t_sec))
+    except Exception:
+        horizons_smooth = horizons
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 8),
+                                   gridspec_kw={'height_ratios': [3, 1]},
+                                   sharex=True)
+
+    ax1.plot(times, measured_smooth, color='steelblue', lw=1.0,  label='Measured (10s median)')
+    ax1.plot(times, horizons_smooth, color='red', lw=1.5, ls='--',
+             alpha=0.8, label='Horizons (predicted)')
+    ax1.set_ylabel('Frequency [MHz]')
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.4f}'))
+    ax1.legend(fontsize=9)
+    ax1.grid(True, alpha=0.3)
+    rms_str = f"  RMS={rms_hz:.1f} Hz" if rms_hz is not None else ""
+    ax1.set_title(f"Doppler vs Horizons  |  {title}{rms_str}  |  n={len(pairs)}")
+
+    # Residuals vs smoothed Horizons
+    residuals_smooth = [m - h for m, h in zip(measured_smooth, horizons_smooth)]
+    ax2.plot(times, residuals_smooth, color='gray', lw=0.8)
+    ax2.axhline(0, color='black', lw=0.5)
+    ax2.set_ylabel('Residual [Hz]')
+    ax2.set_xlabel('Time (UTC)')
+    ax2.grid(True, alpha=0.3)
+
+    for ax in (ax1, ax2):
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    fig.autofmt_xdate()
+    plt.tight_layout()
+    plt.savefig(str(output_png), dpi=120)
+    plt.close()
+    print(f"  Doppler plot saved: {output_png}")
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -2727,6 +2937,26 @@ def build_parser():
                        "Stack K consecutive frames before ridge tracking in --weak mode "
                        "(default: 1, no stacking). Use 3-10 for extra SNR boost."
                    ))
+    p.add_argument("--refine-bw", type=float, default=500.0,
+                   help=(
+                       "CW refinement bandwidth [Hz] around Viterbi position in --weak mode "
+                       "(default: 500). Reduce to <half the component separation to lock onto "
+                       "one spectral component of a suppressed-carrier signal."
+                   ))
+    p.add_argument("--narrowband", type=float, default=None,
+                   help=(
+                       "Narrowband decimation: derotate IQ around carrier_hint, "
+                       "lowpass filter ±BW_HZ, decimate. Reduces bin size dramatically "
+                       "(e.g. ±5000 Hz → 500 kSps decimated ×50 → 0.15 Hz/bin). "
+                       "Eliminates Viterbi bin-hopping, RMS <0.5 Hz possible. "
+                       "Requires --carrier-hint."
+                   ))
+    p.add_argument("--blank-bursts", type=float, default=None, metavar="THRESHOLD_DB",
+                   help=(
+                       "Blank RFI bursts before processing. Computes power in short windows "
+                       "(~1 ms), zeros out windows exceeding median power by THRESHOLD_DB. "
+                       "Typical value: 6-15 dB. Applied before --narrowband."
+                   ))
     p.add_argument("--max-samples",  type=int,  default=None,
                    help="Load only first N samples (for testing on large files)")
     p.add_argument("--skip-samples", type=int,  default=None,
@@ -2740,6 +2970,16 @@ def build_parser():
     p.add_argument("--comment", type=str)
     p.add_argument("--plot", action="store_true",
                    help="Save Welch spectrum plot to PNG (requires matplotlib)")
+    p.add_argument("--plot-doppler", action="store_true",
+                   help=(
+                       "Save Doppler vs Horizons comparison plot to PNG. "
+                       "Requires --spacecraft and --location."
+                   ))
+    p.add_argument("--fade-timeout", type=float, default=None,
+                   help=(
+                       "Stop processing after N seconds of consecutive low-SNR blocks "
+                       "(default: disabled). Useful when signal fades partway through."
+                   ))
     p.add_argument("--no-interactive", action="store_true",
                    help="Disable interactive diagnostics and progress bar (for scripts/cron)")
     return p
@@ -2778,6 +3018,10 @@ def main():
         print(f"  Freq      : {info['center_freq']/1e6:.6f} MHz")
         if info["start_time"]:
             print(f"  Start     : {info['start_time'].isoformat()}")
+        if info.get("hw"):
+            print(f"  HW        : {info['hw']}")
+        if info.get("pps_captures", 0) > 0:
+            print(f"  PPS sync  : {info['pps_captures']} verified timestamps")
         print(f"\nLoading IQ from: {data_path}")
         iq = load_iq(data_path, info["datatype"], args.max_samples, args.skip_samples)
     elif is_wav:
@@ -2792,6 +3036,8 @@ def main():
             print(f"  Start     : {info['start_time'].isoformat()}")
         if info.get("hw"):
             print(f"  HW        : {info['hw']}")
+        if info.get("pps_captures", 0) > 0:
+            print(f"  PPS sync  : {info['pps_captures']} verified timestamps")
         print(f"  Data at   : offset {info['data_offset']} bytes")
         print(f"\nLoading IQ from: {data_path}")
         iq = load_iq(data_path, info["datatype"], args.max_samples, args.skip_samples,
@@ -2816,6 +3062,11 @@ def main():
     if args.start: info["start_time"]  = _parse_dt(args.start)
     if args.skip_samples and info.get("start_time") and info.get("sample_rate"):
         info["start_time"] += timedelta(seconds=args.skip_samples / info["sample_rate"])
+        # Offset pps_table sample indices so _make_pps_interp sees correct positions
+        if info.get("pps_table"):
+            skip = args.skip_samples
+            info["pps_table"] = [(s - skip, t) for s, t in info["pps_table"]
+                                 if s >= skip]
 
     missing = [k for k in ("center_freq","sample_rate","start_time") if not info.get(k)]
     if missing:
@@ -2826,6 +3077,59 @@ def main():
 
     cf, sr, t0 = info["center_freq"], info["sample_rate"], info["start_time"]
 
+    # -- Optional burst blanking (handled inside process_iq per block) ------
+    # args.blank_bursts passes the threshold to process_iq — no copy needed
+
+    # -- Optional narrowband decimation ------------------------------------
+    if args.narrowband is not None:
+        if args.carrier_hint is None:
+            sys.exit("ERROR: --narrowband requires --carrier-hint")
+        from scipy.signal import resample_poly as _resample_poly_nb
+        bw = float(args.narrowband)          # one-sided bandwidth [Hz]
+        # Decimation factor: keep at least 4× oversampling within ±bw
+        decimate = max(1, int(sr / (4 * bw)))
+        n_samp_before = len(iq)
+        # 1. Derotate IQ to bring carrier_hint to DC (chunked to avoid 46 GiB t_idx)
+        _chunk = 10_000_000
+        _omega = -2 * np.pi * args.carrier_hint / sr
+        iq_rot = np.empty(len(iq), dtype=np.complex64)
+        for _s in range(0, len(iq), _chunk):
+            _e = min(_s + _chunk, len(iq))
+            _t = np.arange(_s, _e, dtype=np.float64)
+            _ph = (_omega * _t).astype(np.float32)
+            iq_rot[_s:_e] = iq[_s:_e] * (np.cos(_ph) + 1j * np.sin(_ph)).astype(np.complex64)
+            del _t, _ph
+        iq = iq_rot
+        del iq_rot
+        # 2. Filter + decimate using polyphase resample_poly (fast, low RAM)
+        iq = _resample_poly_nb(iq, 1, decimate).astype(np.complex64)
+        # 3. Decimate
+        iq = np.ascontiguousarray(iq[::decimate])
+        new_sr = sr / decimate
+        # Effective bin after Welch sub-blocking: sub_block = spb // n_sub
+        # spb = new_sr * integration, eff_fft = min(fft_size, spb // n_sub)
+        _spb_est = int(new_sr * args.integration)
+        _sub_est = max(1, _spb_est // args.welch_sub)
+        _eff_fft_est = min(args.fft_size, _sub_est)
+        new_bin = new_sr / _eff_fft_est
+        # After derotation signal is at DC → new carrier_hint = 0
+        old_hint = args.carrier_hint
+        args.carrier_hint = 0.0
+        args.hint_bw = bw * 1.1   # tight search around DC
+        # Update metadata
+        info["center_freq"] = cf + old_hint   # new effective center = old center + hint
+        cf = info["center_freq"]
+        print(f"\n  [narrowband] carrier_hint={old_hint:+.1f} Hz → derotated to DC")
+        print(f"  [narrowband] BW=±{bw:.0f} Hz, decimation ×{decimate}, "
+              f"{n_samp_before:,} → {len(iq):,} samples, "
+              f"rate {sr/1e3:.1f} kSps → {new_sr/1e3:.1f} kSps, "
+              f"Welch bin {sr/args.fft_size:.3f} Hz → {new_bin:.4f} Hz")
+        sr = new_sr
+        info["sample_rate"] = sr
+        # Rescale PPS table sample indices to decimated domain
+        if info.get("pps_table"):
+            info["pps_table"] = [(s // decimate, t) for s, t in info["pps_table"]]
+
     # -- Optional spectrum plot ---------------------------------------------
     if args.plot:
         plot_out = Path(args.output or f"{args.station}_spectrum").with_suffix(".png")
@@ -2834,8 +3138,43 @@ def main():
                       n_sub=50,
                       duration_sec=min(120.0, len(iq)/sr))
 
+    # -- Pre-query Horizons for carrier hint (avoids locking onto birdies) ----
+    if args.spacecraft and args.location and args.carrier_hint is None:
+        try:
+            spk = _SPACECRAFT_SPK.get(args.spacecraft.upper())
+            if spk:
+                parts = args.location.split(",")
+                lon, lat = float(parts[1]), float(parts[0])
+                alt_km = float(parts[2]) / 1000 if len(parts) >= 3 else 0
+                site_coord = f"{lon},{lat},{alt_km:.3f}"
+                t_mid = t0 + timedelta(seconds=len(iq) / sr / 2)
+                t_q0 = (t_mid - timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M')
+                t_q1 = (t_mid + timedelta(minutes=1)).strftime('%Y-%m-%d %H:%M')
+                f_tx = _SPACECRAFT_TX_FREQ.get(args.spacecraft.upper())
+                if not f_tx:
+                    raise ValueError(f"no TX freq for {args.spacecraft}")
+                hor = _query_horizons(spk, site_coord, t_q0, t_q1)
+                if hor:
+                    deldot = hor[0][1]  # km/s
+                    C_KMS = 299792.458
+                    f_rx = f_tx * (1.0 - deldot / C_KMS)
+                    pred_offset = f_rx - cf
+                    args.carrier_hint = pred_offset
+                    # Use tight search window unless user specified --hint-bw
+                    if args.hint_bw == 50_000:  # default value, not user-set
+                        args.hint_bw = 2000
+                    # Force weak mode for Horizons-guided search
+                    # (per-block Welch often locks onto birdies)
+                    if not args.weak:
+                        args.weak = True
+                    print(f"\n  [Horizons] TX={f_tx/1e6:.3f} MHz, "
+                          f"predicted RX at {pred_offset:+.0f} Hz "
+                          f"from center (auto-hint ±{args.hint_bw} Hz, weak mode)")
+        except Exception as e:
+            print(f"  [Horizons] Pre-query failed: {e} (proceeding without hint)")
+
     # -- Main processing ----------------------------------------------------
-    meas, transitions = process_iq(
+    meas, transitions, final_welch_sub = process_iq(
         iq, sr, cf, t0,
         integration_sec = args.integration,
         fft_size        = args.fft_size,
@@ -2852,12 +3191,42 @@ def main():
         weak            = args.weak,
         max_drift       = args.max_drift,
         weak_stack      = args.weak_stack,
+        refine_bw       = args.refine_bw,
+        fade_timeout    = args.fade_timeout,
+        pps_table       = info.get("pps_table", []),
+        burst_blank_db  = args.blank_bursts,
     )
 
     if not meas:
         print("\nERROR: No measurements -- signal too weak or SNR threshold too high.")
         print("Try: --min-snr 1.5  --welch-sub 100  --carrier-hint <Hz>")
         sys.exit(1)
+
+    # -- Remove outliers (spike interference, Viterbi glitches) -------------
+    if len(meas) >= 5:
+        offsets = np.array([m[1] for m in meas])
+        # Use median of ±2 neighbors as expected value
+        clean = []
+        removed = 0
+        for i, m in enumerate(meas):
+            if i < 2 or i >= len(meas) - 2:
+                clean.append(m)
+                continue
+            neighbors = np.concatenate([offsets[i-2:i], offsets[i+1:i+3]])
+            expected = np.median(neighbors)
+            # Threshold: 3× MAD of full dataset, minimum 20 Hz
+            if i == 2:  # compute once
+                mad = np.median(np.abs(offsets - np.median(offsets)))
+                threshold = max(20.0, 3.0 * mad)
+            if abs(m[1] - expected) > threshold:
+                removed += 1
+            else:
+                clean.append(m)
+        if removed > 0:
+            print(f"  [outlier] Removed {removed} outlier(s) "
+                  f"(threshold: {threshold:.0f} Hz, "
+                  f"{len(clean)}/{len(meas)} kept)")
+            meas = clean
 
     # -- Classify transponder transitions -----------------------------------
     if transitions:
@@ -2884,7 +3253,7 @@ def main():
         f"{loc_line}"
         f"Source: {inp.name}\n"
         f"HW: {info.get('hw','?')} | "
-        f"FFT={args.fft_size} Welch={args.welch_sub} int={args.integration}s | "
+        f"FFT={args.fft_size} Welch={final_welch_sub} int={args.integration}s | "
         f"mode={mode_str}"
     )
     write_tdm(meas, out, args.station, cf, args.integration,
@@ -2915,6 +3284,21 @@ def main():
                       args.integration, args.originator, args.dsn_station,
                       drift_cmt, participant_1=args.spacecraft,
                       mode_transitions=transitions)
+
+        # -- Plot Doppler vs Horizons ------------------------------------------
+        if getattr(args, 'plot_doppler', False) and val:
+            pairs = val.get('all_pairs') or val.get('pairs') or []
+            if pairs:
+                plot_stem = out.with_suffix('')
+                plot_png  = Path(str(plot_stem) + '_doppler.png')
+                sc_name   = args.spacecraft or 'ORION'
+                title_str = f"{args.station} — {sc_name}"
+                plot_doppler_vs_horizons(pairs, plot_png,
+                                         title=title_str,
+                                         rms_hz=val.get('rms'),
+                                         center_freq_hz=cf)
+            else:
+                print("  [plot-doppler] No Horizons pairs available for plot.")
 
 
 if __name__ == "__main__":
