@@ -2,6 +2,9 @@
 """
 IQ -> NASA CCSDS TDM Converter  (Welch averaging for weak signals)
 ==================================================================
+Copyright 2026 Tomasz Blazej, SP5LOT. Licensed under PolyForm Noncommercial 1.0.0
+(see LICENSE): free for non-commercial use; commercial use requires a licence.
+
 Converts SDR IQ recordings (SigMF, GQRX, or WAV) to a NASA CCSDS TDM v2.0 file
 for Artemis II / lunar mission one-way Doppler tracking.
 
@@ -546,6 +549,11 @@ def welch_psd(iq_block, fft_size, n_sub):
         n_sub=100 -> +20 dB
         n_sub=500 -> +27 dB
 
+    Coherent mode (n_sub=1, fft_size >= len(iq_block)):
+      Single zero-padded FFT over entire block. Equivalent to Goertzel
+      single-bin DFT but with full spectrum output. SNR gain = N·sample_rate
+      (linear, not sqrt). Used by --coherent flag.
+
     Args:
         iq_block : complex64 array
         fft_size : single FFT size (should be power of 2)
@@ -554,6 +562,17 @@ def welch_psd(iq_block, fft_size, n_sub):
     Returns:
         Averaged power spectrum (float64), length fft_size
     """
+    # Coherent path: zero-padded single FFT over full block (no overlap, no avg)
+    if n_sub == 1 and fft_size >= len(iq_block):
+        n_use = len(iq_block)
+        if n_use < 2:
+            raise ValueError("Block too short for FFT")
+        win  = np.hanning(n_use).astype(np.float32)
+        wsum = float(np.sum(win ** 2))
+        seg  = iq_block - np.mean(iq_block)
+        spec = np.fft.fft(seg * win, n=fft_size)
+        return (np.abs(spec) ** 2).astype(np.float64) / wsum
+
     hop    = fft_size // 2   # 50% overlap
     window = np.hanning(fft_size).astype(np.float32)
     wsum   = float(np.sum(window ** 2))
@@ -580,9 +599,12 @@ def _parabolic(psd, k, fft_size, sr):
     """Parabolic interpolation of FFT bin -> more accurate offset [Hz]."""
     if 0 < k < fft_size - 1:
         y1, y2, y3 = psd[k-1], psd[k], psd[k+1]
+        if y1 > 0 and y2 > 0 and y3 > 0:
+            # Log-power (Gaussian) interpolation: ~7x smaller bias than linear power with a Hann window
+            y1, y2, y3 = np.log(y1), np.log(y2), np.log(y3)
         denom = 2*y2 - y1 - y3
         if denom > 0:
-            delta = 0.5 * (y1 - y3) / denom
+            delta = 0.5 * (y3 - y1) / denom
             return (k + delta) * sr / fft_size
     return k * sr / fft_size
 
@@ -828,7 +850,7 @@ def _viterbi_ridge(psd_db, freq_axis, max_drift_hz_per_step, stack_k=1):
             y3 = psd_work[t, k + 1]
             denom = 2 * y2 - y1 - y3
             if denom > 0:
-                delta = 0.5 * (y1 - y3) / denom
+                delta = 0.5 * (y3 - y1) / denom
                 track_freq[t] = freq_axis[k] + delta * bin_hz
             else:
                 track_freq[t] = freq_axis[k]
@@ -1180,8 +1202,15 @@ def process_iq(
     Returns: list of (datetime, freq_hz, snr_db)
     """
     spb    = int(sample_rate * integration_sec)   # samples per block
-    eff_fft = min(fft_size, spb // 2)
-    eff_fft = max(1024, 2 ** int(math.log2(eff_fft)))
+    # Coherent integration mode: n_sub=1 with fft_size >= block length triggers
+    # single zero-padded FFT in welch_psd (Goertzel-equivalent). Don't cap eff_fft
+    # at spb/2 in that case — we want fft_size to span (or exceed) the full block.
+    _coherent_mode = (n_welch_sub == 1 and fft_size >= spb)
+    if _coherent_mode:
+        eff_fft = max(1024, 2 ** int(math.log2(fft_size)))
+    else:
+        eff_fft = min(fft_size, spb // 2)
+        eff_fft = max(1024, 2 ** int(math.log2(eff_fft)))
     n_blocks = len(iq) // spb
     bin_hz   = sample_rate / eff_fft
 
@@ -1698,6 +1727,10 @@ def process_iq(
     probe_n = min(20, max(10, n_blocks // 10))
     # Probe phase always runs (adaptive welch-sub tuning works even without TTY)
     probe_done = probe_n >= n_blocks
+    # Coherent mode bypasses probe/adaptive entirely — by design n_sub=1 is fixed
+    # (Goertzel-style single-FFT integration; adaptive sub-blocking would defeat it).
+    if _coherent_mode:
+        probe_done = True
 
     t0_proc = time.time()
 
@@ -2076,12 +2109,72 @@ _SPACECRAFT_TX_FREQ = {
     'WIND': 2270.400e6,
     'DSCOVR': 2282.500e6,
     'JWST': 2270.500e6,
-    'ORION': 2216.500e6, 'ARTEMIS': 2216.500e6,
+    # Measured, not nominal: 2216.500 MHz is off by -1896 Hz. The nominal value
+    # made the Horizons auto-hint miss the carrier, so Welch locked onto the
+    # much stronger OQPSK sidebands instead. Value recovered from NASA FDF
+    # residuals over 10 passes / 7 days, spread 23 Hz, and confirmed
+    # independently from raw IQ (2216.498109 MHz on the 20260404_221416 pass).
+    'ORION': 2216.498104e6, 'ARTEMIS': 2216.498104e6,
 }
 
 C_KMS = 299_792.458  # speed of light [km/s]
 
+def _horizons_from_cache(spk_id, site_coord, t_start_str, t_stop_str):
+    """Fall back to a locally cached ephemeris when Horizons has none online.
+
+    JPL drops ephemerides for a spacecraft once its mission ends (Orion was
+    removed after the Artemis II splashdown), which silently disables both the
+    carrier auto-hint and the per-segment TDM split. Any ephemeris we fetched
+    while the mission was live is still perfectly valid, so use it.
+
+    Returns the same (datetime, deldot_km_s, elevation_deg) rows as the online
+    query, or None when no cache covers the requested window.
+    """
+    try:
+        import numpy as _np
+        from pathlib import Path as _Path
+
+        name = next((k for k, v in _SPACECRAFT_SPK.items() if v == spk_id), None)
+        if not name:
+            return None
+        # site_coord is "lon,lat,alt_km"; cache files are named by lat/lon/alt_m
+        lon_s, lat_s, alt_s = (site_coord.split(',') + ['0', '0'])[:3]
+        lat, lon, alt_m = float(lat_s), float(lon_s), float(alt_s) * 1000.0
+
+        cache_dir = _Path(__file__).resolve().parent / 'horizons_cache'
+        path = cache_dir / f'{name.upper()}_{lat:.4f}_{lon:.4f}_{alt_m:.0f}.npz'
+        if not path.exists():
+            return None
+
+        d = _np.load(path, allow_pickle=True)
+        ts, dd, el = d['timestamps'], d['deldot'], d['elevation']
+
+        t0 = datetime.strptime(t_start_str, '%Y-%m-%d %H:%M').replace(
+            tzinfo=timezone.utc).timestamp() - 120.0
+        t1 = datetime.strptime(t_stop_str, '%Y-%m-%d %H:%M').replace(
+            tzinfo=timezone.utc).timestamp() + 120.0
+        sel = (ts >= t0) & (ts <= t1)
+        if not sel.any():
+            return None
+
+        rows = [(datetime.fromtimestamp(float(t), tz=timezone.utc),
+                 float(v), float(e))
+                for t, v, e in zip(ts[sel], dd[sel], el[sel])]
+        print(f" [cache: {len(rows)} pts]", end='', flush=True)
+        return rows
+    except Exception:
+        return None
+
+
 def _query_horizons(spk_id, site_coord, t_start_str, t_stop_str):
+    """Query Horizons online, falling back to a local cache if it has nothing."""
+    rows = _query_horizons_online(spk_id, site_coord, t_start_str, t_stop_str)
+    if rows:
+        return rows
+    return _horizons_from_cache(spk_id, site_coord, t_start_str, t_stop_str)
+
+
+def _query_horizons_online(spk_id, site_coord, t_start_str, t_stop_str):
     """Query JPL Horizons for range-rate and elevation.
     Returns list of (datetime, deldot_km/s, elevation_deg) or None.
     """
@@ -2951,6 +3044,23 @@ def build_parser():
                        "Eliminates Viterbi bin-hopping, RMS <0.5 Hz possible. "
                        "Requires --carrier-hint."
                    ))
+    p.add_argument("--derotate", action="store_true",
+                   help=(
+                       "Counter-rotation: multiply IQ by exp(-j·2π·∫f_pred(t)dt) "
+                       "using JPL Horizons-predicted Doppler before Welch/Viterbi. "
+                       "Signal sits near DC after correction; enables higher welch-sub "
+                       "without peak smearing. Requires --spacecraft and --location. "
+                       "Not compatible with --narrowband."
+                   ))
+    p.add_argument("--coherent", type=float, default=None, metavar="SECONDS",
+                   help=(
+                       "Coherent integration mode (Goertzel-equivalent): single "
+                       "zero-padded FFT spans entire N-second block, no Welch "
+                       "sub-blocking, no adaptive logic. SNR gain scales linearly "
+                       "with N (not sqrt). Recommended together with --derotate "
+                       "for weak signals. Typical: 10–30 s. Overrides --integration, "
+                       "--welch-sub, --fft-size."
+                   ))
     p.add_argument("--blank-bursts", type=float, default=None, metavar="THRESHOLD_DB",
                    help=(
                        "Blank RFI bursts before processing. Computes power in short windows "
@@ -3077,8 +3187,136 @@ def main():
 
     cf, sr, t0 = info["center_freq"], info["sample_rate"], info["start_time"]
 
+    # -- Coherent integration mode (Goertzel) ---------------------------------
+    # Override integration/welch-sub/fft-size to enforce single-FFT per block.
+    if args.coherent is not None:
+        if args.coherent <= 0:
+            sys.exit("ERROR: --coherent must be > 0 seconds")
+        if args.weak or args.oqpsk or args.auto:
+            sys.exit("ERROR: --coherent is not compatible with --weak/--oqpsk/--auto")
+        _spb_coh = int(sr * args.coherent)
+        if _spb_coh < 1024:
+            sys.exit(f"ERROR: --coherent {args.coherent}s × {sr/1e3:.0f} kSps "
+                     f"= {_spb_coh} samples (need ≥ 1024)")
+        # Next pow2 ≥ spb (covers full block; numpy zero-pads if pad needed).
+        _fft_pow2 = 1 << ((_spb_coh - 1).bit_length())
+        # Memory cap: complex128 internal during FFT ~16 bytes/bin
+        _fft_bytes = _fft_pow2 * 16
+        if _fft_bytes > 4 * 1024**3:
+            sys.exit(f"ERROR: --coherent {args.coherent}s requires "
+                     f"{_fft_pow2:,}-pt FFT ({_fft_bytes/1e9:.1f} GB) — too large")
+        args.integration = float(args.coherent)
+        args.welch_sub   = 1
+        args.fft_size    = _fft_pow2
+        print(f"\n  [coherent] integration={args.integration:.1f}s, n_sub=1, "
+              f"fft_size={_fft_pow2:,} ({100.0*_spb_coh/_fft_pow2:.1f}% block fill, "
+              f"~{_fft_bytes/1e6:.0f} MB FFT)")
+        print(f"  [coherent] bin_width={sr/_fft_pow2:.4f} Hz, "
+              f"theoretical SNR gain over per-sample: "
+              f"+{10*np.log10(_spb_coh):.1f} dB")
+
     # -- Optional burst blanking (handled inside process_iq per block) ------
     # args.blank_bursts passes the threshold to process_iq — no copy needed
+
+    # -- Optional counter-rotation via Horizons (time-varying Doppler) ------
+    # Applied BEFORE --narrowband. Multiplies IQ by exp(-j·2π·∫f_off(t)dt) where
+    # f_off(t) = f_tx·(1-deldot(t)/c) - cf. After derotation the signal is near
+    # DC, so welch-sub can be raised without peak smearing. f_off(t) is added
+    # back to each measurement later to restore absolute carrier frequency.
+    if args.derotate:
+        if args.narrowband is not None:
+            sys.exit("ERROR: --derotate and --narrowband are mutually exclusive")
+        if not args.spacecraft or not args.location:
+            sys.exit("ERROR: --derotate requires --spacecraft and --location")
+        try:
+            from horizons_cache import load_or_fetch as _hc_load_or_fetch
+        except ImportError:
+            sys.exit("ERROR: --derotate requires horizons_cache.py in PYTHONPATH")
+        from scipy.interpolate import CubicSpline as _CubicSpline
+        spk_id = _SPACECRAFT_SPK.get(args.spacecraft.upper())
+        if not spk_id:
+            sys.exit(f"ERROR: --derotate: unknown spacecraft {args.spacecraft} "
+                     f"(add to _SPACECRAFT_SPK)")
+        f_tx = _SPACECRAFT_TX_FREQ.get(args.spacecraft.upper())
+        if f_tx is None:
+            sys.exit(f"ERROR: --derotate: no TX freq for {args.spacecraft} "
+                     f"(add to _SPACECRAFT_TX_FREQ)")
+        lat_d, lon_d, alt_d = map(float, args.location.split(","))
+        t_start_sess = t0
+        t_end_sess   = t0 + timedelta(seconds=len(iq) / sr + 60)
+        print(f"\n  [derotate] Querying Horizons cache "
+              f"({args.spacecraft} SPK {spk_id}) ...")
+        _rows = _hc_load_or_fetch(args.spacecraft, spk_id,
+                                   lat_d, lon_d, alt_d,
+                                   t_start_sess, t_end_sess)
+        if not _rows or len(_rows) < 2:
+            sys.exit("ERROR: --derotate: Horizons cache miss and query failed")
+        # Build f_off(t) interpolator from (t_unix, deldot_km_s)
+        _ts_u   = np.array([r[0].timestamp() for r in _rows], dtype=np.float64)
+        _deldot_kms = np.array([r[1] for r in _rows], dtype=np.float64)
+        # f_rx = f_tx · (1 - deldot/c);  f_off = f_rx - cf
+        # Use local constant (C_KMS is reassigned later in main() so cannot ref module-level here)
+        _C_LIGHT_KMS = 299_792.458
+        _f_pred = f_tx * (1.0 - _deldot_kms / _C_LIGHT_KMS)
+        _f_off_arr = _f_pred - cf
+        _f_off_spline = _CubicSpline(_ts_u, _f_off_arr, extrapolate=True)
+        # Antiderivative gives exact cumulative phase integral — used by wrapper
+        _f_off_anti = _f_off_spline.antiderivative()
+        _t0_unix = t0.timestamp()
+
+        # Wrap iq with lazy per-slice derotation — avoids 35 GB second allocation
+        # for full memmap files. Slice reads from the wrapper return derotated
+        # complex64 numpy arrays. process_iq sees a drop-in iq replacement.
+        class _DerotatedIQ:
+            __slots__ = ("_iq", "_sr", "_t0", "_anti", "_anti_t0")
+            def __init__(self, iq_src, sr_, t0_unix_, anti_):
+                self._iq      = iq_src
+                self._sr      = sr_
+                self._t0      = t0_unix_
+                self._anti    = anti_
+                self._anti_t0 = float(anti_(t0_unix_))
+            def __len__(self):
+                return len(self._iq)
+            def __getitem__(self, sl):
+                if isinstance(sl, slice):
+                    start, stop, _ = sl.indices(len(self._iq))
+                else:
+                    start, stop = int(sl), int(sl) + 1
+                block = np.array(self._iq[start:stop], dtype=np.complex64,
+                                 copy=True)
+                if len(block) == 0:
+                    return block
+                t_arr = self._t0 + np.arange(start, stop,
+                                              dtype=np.float64) / self._sr
+                # phase(t) = 2π·∫_{t0}^{t} f_off(τ)dτ — exact via antiderivative
+                phase = 2.0 * np.pi * (self._anti(t_arr) - self._anti_t0)
+                # Wrap to [-π, π] so cos/sin keep float32 precision over long
+                # sessions where unwrapped phase reaches ~10^7 rad
+                phase_mod = np.mod(phase + np.pi, 2.0 * np.pi) - np.pi
+                block *= (np.cos(phase_mod).astype(np.float32) -
+                          1j * np.sin(phase_mod).astype(np.float32))
+                return block
+
+        iq = _DerotatedIQ(iq, sr, _t0_unix, _f_off_anti)
+        # Stash spline + flag into info for later f_off add-back
+        info["_derotate_active"]  = True
+        info["_derotate_spline"]  = _f_off_spline
+        info["_derotate_f_tx"]    = f_tx
+        info["_derotate_f_off_start"] = float(_f_off_spline(_t0_unix))
+        info["_derotate_n_ephem"] = len(_rows)
+        # Derotation removes the time-varying Doppler ramp from the IQ. After
+        # derotation, ALL spectral components (carrier, subcarriers, sidebands)
+        # sit at their nominal time-invariant offsets from the spacecraft TX
+        # frequency. The user's --carrier-hint already names which component
+        # to track (e.g. +24885 Hz for an Orion subcarrier), so we do NOT
+        # override it. If no hint was given we leave None — auto-detect picks
+        # the strongest peak in the wide search window.
+        print(f"  [derotate] {len(_rows)} ephem pts, "
+              f"f_off @ start = {info['_derotate_f_off_start']:+.1f} Hz "
+              f"(f_tx={f_tx/1e6:.3f} MHz)")
+        print(f"  [derotate] Lazy wrapper installed on {len(iq):,} samples "
+              f"(no extra RAM); carrier_hint preserved "
+              f"({args.carrier_hint if args.carrier_hint is not None else 'auto'})")
 
     # -- Optional narrowband decimation ------------------------------------
     if args.narrowband is not None:
@@ -3202,6 +3440,20 @@ def main():
         print("Try: --min-snr 1.5  --welch-sub 100  --carrier-hint <Hz>")
         sys.exit(1)
 
+    # -- Add back Horizons-predicted offset when --derotate is active -------
+    # process_iq found peaks near DC (because we derotated the IQ earlier).
+    # Restore absolute carrier freq by adding f_off(t_center) per measurement.
+    if info.get("_derotate_active"):
+        _spline = info["_derotate_spline"]
+        _meas_corrected = []
+        for (_t, _f_abs_near_cf, _snr) in meas:
+            _f_off_at = float(_spline(_t.timestamp()))
+            _meas_corrected.append((_t, _f_abs_near_cf + _f_off_at, _snr))
+        meas = _meas_corrected
+        print(f"  [derotate] Added back f_off(t) to {len(meas)} measurements; "
+              f"mean offset restored = "
+              f"{np.mean([float(info['_derotate_spline'](t.timestamp())) for t,_,_ in meas]):+.1f} Hz")
+
     # -- Remove outliers (spike interference, Viterbi glitches) -------------
     if len(meas) >= 5:
         offsets = np.array([m[1] for m in meas])
@@ -3248,9 +3500,17 @@ def main():
             ns = "N" if lat >= 0 else "S"
             ew = "E" if lon >= 0 else "W"
             loc_line = f"Station: {args.station} ({abs(lat):.2f}{ns}, {abs(lon):.2f}{ew}{alt})\n"
+    derot_line = ""
+    if info.get("_derotate_active"):
+        derot_line = (
+            f"Counter-rotation: JPL Horizons deldot "
+            f"(f_off start = {info['_derotate_f_off_start']:+.1f} Hz, "
+            f"{info['_derotate_n_ephem']} ephem pts)\n"
+        )
     auto_cmt = (
         f"{args.spacecraft or 'ORION'} Doppler tracking\n"
         f"{loc_line}"
+        f"{derot_line}"
         f"Source: {inp.name}\n"
         f"HW: {info.get('hw','?')} | "
         f"FFT={args.fft_size} Welch={final_welch_sub} int={args.integration}s | "

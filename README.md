@@ -564,7 +564,11 @@ Reference data used for validation (CC BY 4.0, Stichting CAMRAS, Dwingeloo):
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+PolyForm Noncommercial 1.0.0, see [LICENSE](LICENSE).
+
+- Free for non-commercial use: amateur radio, education, research, personal projects.
+- Commercial use (products, paid services, use inside a company) requires a separate licence from the author. Please contact SP5LOT through GitHub.
+- Versions published before October 2026 (up to commit d340e99) were released under the MIT licence and remain available under those terms.
 
 ## Author
 
